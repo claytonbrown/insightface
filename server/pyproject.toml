@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insightface-server"
-version = "0.2.0"
+version = "0.3.1"
 description = "Simple self-hosted InsightFace REST API and management UI"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
@@ -20,7 +20,6 @@ where = ["backend"]
 
 [tool.setuptools.package-data]
 "insightface_server.licensing" = [
-  "trusted_keys/*.pem",
   "defaults/*/MODEL.LICENSE",
 ]
 

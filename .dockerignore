@@ -9,6 +9,8 @@
 !python-package/insightface/__init__.py
 !python-package/insightface/app/
 !python-package/insightface/app/**
+!python-package/insightface/addons/
+!python-package/insightface/addons/**
 !python-package/insightface/model_zoo/
 !python-package/insightface/model_zoo/**
 !python-package/insightface/utils/
@@ -35,9 +37,10 @@ server/test-results/
 **/._*
 **/.DS_Store
 server/**/dist/
+**/README_INTERNAL*.md
 **/*.onnx
 **/.env
 **/.env.*
 **/*.key
 **/*.pem
-!server/backend/insightface_server/licensing/trusted_keys/*.pem
+!python-package/insightface/model_zoo/trusted_keys/*.pem

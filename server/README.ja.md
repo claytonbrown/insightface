@@ -8,7 +8,7 @@
 推論を1つのコンテナで提供するセルフホスト型顔認識サーバーです。**
 
 ```text
-画像をアップロード -> 検出、比較、登録、検索
+画像をアップロード -> 検出、生体検知、比較、登録、検索
 ```
 
 > **モデルライセンス:** 公開 InsightFace 学習済みモデルは通常、非商用研究用途に
@@ -20,16 +20,23 @@ Rekognition よりシンプルでプライバシー重視の選択肢です。�
 モデル、索引をネットワーク内に保持できます。AWS 互換製品ではなく、SigV4、
 IAM、Region、AWS リソース意味論は実装しません。
 
-現在のリリース: **0.2.0**、Linux x86_64。
+現在のリリース: **0.3.1**、Linux x86_64。
 
 | Runtime | Image |
 | --- | --- |
-| CPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cpu` |
-| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cuda12` |
+| CPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cpu` |
+| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cuda12` |
 
 移動タグ `cpu` と `cuda12` は各 Runtime の最新安定版を示します。曖昧な
 `latest` は提供しません。リリース方針は
 [Maintainer Guide — English](docs/maintainer-guide.md)を参照してください。
+
+**0.3.1 のデプロイ更新:** Server とモデルインストーラーを root で実行し、
+モデルを単一の書き込み可能なマウントにまとめ、ダウンロード時に addon ディレクトリを
+自動作成します。ホスト UID/GID や共有グループの設定は不要です。イメージタグと
+Compose の両方を更新し、既存のモデル、設定、データを保持してください。0.3.0 から
+Raccoon のモデル記述、生体検知、BMP 入力に対応し、API/SDK の `model_version` を
+廃止しています。[アップグレード手順](docs/user-guide.ja.md#031-へのアップグレード)を参照してください。
 
 ![英語版 InsightFace Server Dashboard](docs/images/customer/dashboard-en.jpg)
 
@@ -46,14 +53,15 @@ IAM、Region、AWS リソース意味論は実装しません。
 - GPU 厳密検索は FP32、FP16、BF16、INT8 のベクトル保存に対応。
 - Dashboard、Collections、People、Detect、Compare、Search、RTSP Monitor、
   System、Help を備えた多言語 Web UI。
-- `/v1` 配下の29個の snake_case REST operation。保護された
+- `/v1` 配下の31個の snake_case REST operation。保護された
   `/v1/embeddings` と軽量 Python SDK を含みます。
 - 有界メモリイベント、複数クライアント、任意の `preview.mjpeg` を備えた
   サーバー側 RTSP Monitor。ブラウザを閉じても監視は停止しません。
-- SQLite を永続的な正本とし、再構築可能なメモリ内厳密索引、読み取り専用
-  `/models`、永続 `/data`、migration、health check、CPU fallback を許さない
+- SQLite を永続的な正本とし、再構築可能なメモリ内厳密索引、単一の書き込み可能なモデルマウントと設定ディレクトリ、永続 `/data`、migration、health check、CPU fallback を許さない
   CUDA 起動検証を提供。
-- JPEG、PNG、WebP をサポートし、元のアップロード画像は既定で保持しません。
+- JPEG、PNG、WebP、BMP をサポートし、元のアップロード画像は既定で保持しません。
+
+生体検知は既定で無効です。`server/config/server.toml` の `inference.addons = []` と `addons.auto_download = []` が初期値です。**システム → 生体検知** でモデルをダウンロード・検証すると次回起動の設定が保存され、手動再起動で有効になります。検証済みキャッシュは再利用します。起動時にはダウンロードせず、有効な addon のモデルがなければインストール方法を示して起動を停止します。評価済みの顔は基本の3項目 `status`、`is_live`、`live_score` を返し、`input_rejected` の場合だけユーザー向け説明 `reason` が追加されます。既定モードは `normal`、登録時は既定で省略します（`liveness_on_registration = false`）。[設定、Web 権限、更新手順](docs/user-guide.ja.md#任意の生体検知-addon)を参照してください。
 
 ### RTX 5090 GPU 検索性能
 
@@ -115,14 +123,25 @@ challenge と同じ小数第2位までの表示では FP32 と INT8 の MR-ALL �
 InsightFace リポジトリ全体の checkout で、`server/.models` にモデルを
 インストールします。
 
+リポジトリのルートで実行し、`server/config/server.toml` を用意してください。Server とモデルインストーラーは root（`0:0`）で実行します。Compose は `server/.models` がなければ作成し、単一の書き込み可能な `/models` としてマウントします。`addons/` は addon のダウンロードを要求したときに作成されます。UID/GID の export、addon ディレクトリの手動作成、権限設定は不要です。
+
 ```bash
-mkdir -p server/.models
 docker compose -f server/deploy/compose.cpu.yml pull
 docker compose -f server/deploy/compose.cpu.yml \
   run --rm models install buffalo_l --accept-license
 ```
 
-モデルツールは `buffalo_m`、`buffalo_sc`、`antelopev2` にも対応します。
+モデルのインストールと同時に生体検知を設定する場合は、代わりに次のコマンドを使います：
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+Server を先に起動する必要はありません。新規環境では次の `up -d` で生体検知が有効になります。すでに実行中の場合は `docker compose -f server/deploy/compose.cpu.yml restart server` が必要で、`up -d` だけでは保存済み設定を再読込しません。CUDA では `compose.cuda12.yml` を使います。
+
+モデルツールは `buffalo_l`、`buffalo_m`、`buffalo_s`、`buffalo_sc`、
+`antelopev2`、`raccoon_s`、`raccoon_l` の全 7 パッケージに対応します。
 `manifest.json` と署名済み `MODEL.LICENSE` を作成し、`models verify` で
 検証できます。モデル条件は Server ソースライセンスとは別です。
 
@@ -160,8 +179,12 @@ docker compose -f server/deploy/compose.cpu.yml up -d
 
 ## ソースからビルド
 
+完全なローカルソースディレクトリから直接ビルドできます。未コミットの変更が
+あっても、`.git` ディレクトリがなくても構いません。Git のコミットやプッシュは
+ビルドの前提条件ではありません。
+
 Dockerfile は `server/` と `python-package/insightface/` の選択された推論
-モジュールをコピーするため、リポジトリ全体が build context です。
+モジュールをコピーするため、完全なソースディレクトリが build context です。
 
 CPU:
 
@@ -244,7 +267,7 @@ Server は TLS、ユーザーアカウント、RBAC、cloud IAM、法令遵守�
 
 AWS/CompreFace 互換、CUDA 11、Jetson、ARM64、Windows Container、
 TensorRT、Kubernetes、分散 Worker、Monitor event の永続化、録画/NVR、
-liveness、deepfake、属性分析は実装しません。
+deepfake、属性分析は実装しません。
 
 ## ドキュメント
 

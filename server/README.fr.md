@@ -8,7 +8,7 @@
 simple, SQLite et inférence locale CPU ou GPU NVIDIA dans un seul conteneur.**
 
 ```text
-téléverser une image -> détecter, comparer, inscrire ou rechercher
+téléverser une image -> détecter, effectuer un contrôle du vivant, comparer, inscrire ou rechercher
 ```
 
 > **Licence des modèles :** les modèles publics préentraînés InsightFace sont
@@ -21,16 +21,20 @@ images, embeddings, modèles et index peuvent rester dans votre réseau. Ce n’
 pas un remplacement compatible AWS et il n’implémente ni SigV4, IAM, Region, ni
 la sémantique des ressources AWS.
 
-Version actuelle : **0.2.0**, Linux x86_64.
+Version actuelle : **0.3.1**, Linux x86_64.
 
 | Environnement | Image |
 | --- | --- |
-| CPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cpu` |
-| GPU NVIDIA | `ghcr.io/deepinsight/insightface-server:0.2.0-cuda12` |
+| CPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cpu` |
+| GPU NVIDIA | `ghcr.io/deepinsight/insightface-server:0.3.1-cuda12` |
 
 Les tags mobiles `cpu` et `cuda12` désignent la dernière version stable de
 chaque famille. Aucun tag ambigu `latest` n’est fourni. Voir le
 [Maintainer Guide — English](docs/maintainer-guide.md) pour la politique.
+
+**Nouveautés et mise à niveau vers 0.3.1 :** Server et l’installateur s’exécutent en root ; un seul montage de modèles en écriture remplace le montage séparé des addons. Compose crée le répertoire si nécessaire, sans configuration manuelle des UID/GID ou permissions. Mettez aussi à jour les fichiers Compose et vos surcharges en conservant les chemins des modèles, de la configuration et des données. Consultez la [procédure de mise à niveau](docs/user-guide.fr.md#mise-à-niveau-vers-031).
+
+Depuis 0.3.0, `raccoon_s`, `raccoon_l`, leurs manifestes, la détection du vivant facultative avec installation Web et les images BMP sont pris en charge. Depuis cette version, les résultats API et SDK omettent `model_version`. La détection du vivant reste désactivée tant qu’elle n’est pas activée.
 
 ![Dashboard InsightFace Server en anglais](docs/images/customer/dashboard-en.jpg)
 
@@ -47,15 +51,17 @@ chaque famille. Aucun tag ambigu `latest` n’est fourni. Voir le
 - Recherche GPU exacte avec stockage vectoriel FP32, FP16, BF16 et INT8.
 - Web UI multilingue pour Dashboard, Collections, People, Detect, Compare,
   Search, surveillance RTSP, System et Help.
-- 29 opérations REST snake_case sous `/v1`, dont `/v1/embeddings` protégé, et
+- 31 opérations REST snake_case sous `/v1`, dont `/v1/embeddings` protégé, et
   un SDK Python léger et typé.
 - RTSP Monitors persistants côté serveur, événements bornés en mémoire,
   plusieurs clients et `preview.mjpeg` facultatif ; fermer le navigateur
   n’arrête pas la surveillance.
 - SQLite comme source durable, index exacts mémoire reconstruisibles,
-  `/models` en lecture seule, `/data` persistant, migrations, health checks et
+  un seul montage de modèles en écriture et un répertoire de configuration accessible en écriture, `/data` persistant, migrations, health checks et
   validation CUDA stricte sans fallback CPU silencieux.
-- Entrées JPEG, PNG et WebP ; les originaux ne sont pas conservés par défaut.
+- Entrées JPEG, PNG, WebP et BMP ; les originaux ne sont pas conservés par défaut.
+
+La détection du vivant est désactivée par défaut : `inference.addons = []` et `addons.auto_download = []` dans `server/config/server.toml`. **Système → Détection du vivant** télécharge et vérifie le modèle, puis enregistre l’activation pour le prochain redémarrage manuel ; un fichier vérifié est réutilisé. Aucun téléchargement au démarrage. Un modèle activé manquant arrête le démarrage avec des instructions d’installation. Chaque visage évalué renvoie les champs principaux `status`, `is_live` et `live_score` ; seul `input_rejected` ajoute une explication pour l’utilisateur dans `reason`. Le mode par défaut est `normal` ; l’inscription ignore la détection par défaut (`liveness_on_registration = false`). Voir [configuration, permissions Web et mise à niveau](docs/user-guide.fr.md#addon-optionnel-de-détection-du-vivant).
 
 ### Performances de recherche GPU sur RTX 5090
 
@@ -121,14 +127,25 @@ configuration de production.
 Depuis un checkout complet d’InsightFace, installez un modèle dans
 `server/.models` :
 
+Exécutez les commandes depuis la racine du dépôt avec `server/config/server.toml` présent. Server et l’installateur de modèles s’exécutent en root (`0:0`). Compose crée `server/.models` si nécessaire et le monte une seule fois en écriture dans `/models`. Le sous-répertoire `addons` est créé lors du téléchargement d’un addon. Aucun export UID/GID ni préparation manuelle des répertoires ou permissions n’est nécessaire. Le démarrage normal ne télécharge pas de modèles ; la détection du vivant est désactivée par défaut.
+
 ```bash
-mkdir -p server/.models
 docker compose -f server/deploy/compose.cpu.yml pull
 docker compose -f server/deploy/compose.cpu.yml \
   run --rm models install buffalo_l --accept-license
 ```
 
-L’outil accepte aussi `buffalo_m`, `buffalo_sc` et `antelopev2`. Il écrit
+Pour configurer facultativement la détection du vivant pendant l’installation du modèle, utilisez cette commande à la place :
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+Server n’a pas besoin de fonctionner. Pour une nouvelle installation, le prochain `up -d` active la détection du vivant ; si Server fonctionne déjà, utilisez `docker compose -f server/deploy/compose.cpu.yml restart server`. `up -d` seul ne recharge pas les paramètres enregistrés. Pour CUDA, utilisez `compose.cuda12.yml`.
+
+L’outil accepte les sept paquets : `buffalo_l`, `buffalo_m`, `buffalo_s`,
+`buffalo_sc`, `antelopev2`, `raccoon_s` et `raccoon_l`. Il écrit
 `manifest.json` et le `MODEL.LICENSE` signé ; `models verify` contrôle le
 paquet. Les conditions du modèle sont distinctes de la licence du code Server.
 
@@ -168,8 +185,12 @@ Le [guide utilisateur](docs/user-guide.fr.md) décrit tout le premier parcours.
 
 ## Construire depuis les sources
 
+Vous pouvez construire directement depuis un répertoire local contenant toutes
+les sources, même avec des modifications non committées ou sans répertoire
+`.git`. Les commits et les push Git ne sont pas des prérequis à la construction.
+
 Les Dockerfiles copient `server/` et certains modules d’inférence de
-`python-package/insightface/` ; le dépôt complet est donc le contexte de build.
+`python-package/insightface/` ; le répertoire complet des sources est donc le contexte de build.
 
 CPU :
 
@@ -241,6 +262,8 @@ dans le [guide utilisateur](docs/user-guide.fr.md).
 
 ## Sécurité
 
+Le déploiement fourni utilise root avec les capabilities Docker par défaut et peut écrire dans les montages de modèles, de configuration et de données. Le reste du système de fichiers est en lecture seule et `no-new-privileges` reste actif. Limitez l’accès à l’hôte et les répertoires montés.
+
 Les images faciales et embeddings sont des données biométriques. En réseau,
 activez l’authentification, terminez HTTPS sur un reverse proxy fiable,
 restreignez Docker et les volumes, laissez le CORS large désactivé et définissez
@@ -255,7 +278,7 @@ conformité légale. L’exploitation et la sécurité sont dans le
 
 Sont exclus : compatibilité AWS/CompreFace, CUDA 11, Jetson, ARM64, Windows
 Container, TensorRT, Kubernetes, Workers distribués, événements Monitor
-persistants ou enregistrement/NVR, liveness, deepfake et attributs
+persistants ou enregistrement/NVR, deepfake et attributs
 démographiques.
 
 ## Documentation

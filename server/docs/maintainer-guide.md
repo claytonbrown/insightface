@@ -25,10 +25,19 @@ Primary code lives under `server/`. It may import selected existing modules from
 training, or package behavior unless a separate upstream change explicitly
 requires it.
 
+The supported Server runtime is built from the complete source tree; a `.git`
+directory is not required. Its Docker image places both `server/backend` and
+`python-package` on `PYTHONPATH`. The
+backend-only wheel produced during release checks is not a standalone inference
+distribution; the independently installable client is the SDK wheel under
+`server/sdk/python`.
+
 Do not commit model binaries, signed customer licenses, issuer private keys,
 real face images, customer data, generated databases, or production
-configuration. `/models` is read-only runtime input; `/data` is mutable,
-persistent runtime state.
+configuration. The model root is one writable `/models` mount. The Web liveness
+installer creates `addons/` on an explicit download and writes the configuration directory;
+it does not switch base model packages. `/data` is mutable, persistent runtime
+state.
 
 ## 2. Source architecture
 
@@ -37,7 +46,7 @@ server/
 ├── backend/insightface_server/
 │   ├── api/          request and response schemas, authentication
 │   ├── inference/    provider-independent pipeline and ONNX implementation
-│   ├── licensing/    offline model-license verification and trusted keys
+│   ├── licensing/    compatibility facade for shared model-license handling
 │   ├── models/       manifest, packages, embedding contract
 │   ├── search/       Python facade, native ABI, reference implementation
 │   ├── services/     application workflows and RTSP tasks
@@ -114,7 +123,8 @@ Startup must fail unless all of these succeed:
 2. GPU, Compute Capability, and Driver discovery;
 3. `CUDAExecutionProvider` availability and primary Session placement;
 4. actual loaded CUDA and cuDNN library version inspection;
-5. manifest and signed model-license verification;
+5. manifest and model-license policy validation (a missing file defaults to
+   non-commercial, while an existing invalid license fails);
 6. real detector and recognizer Session creation;
 7. real warm-up through both graphs;
 8. recognition output-dimension verification;
@@ -128,26 +138,40 @@ a broad operator class to silence an audit failure.
 
 Architecture compatibility, actual validation, and Community Tested reports
 are distinct labels. A hardware claim requires a dated record containing the
-source revision, image digest, GPU/Driver, actual CUDA/cuDNN/ORT, model
+build origin, local image ID and any published registry digest, GPU/Driver,
+actual CUDA/cuDNN/ORT, model
 identities/digests, provider lists, strict audit, functional flow, and
 consistency result.
 
 ## 5. Model bundle and offline license design
 
-A model bundle contains detector and recognizer ONNX files, `manifest.json`,
-and `MODEL.LICENSE`. Normal startup never downloads models. The `models`
-Compose tool supports install and verify for public packages; the manifest
-helper supports controlled private bundles.
+A managed public model bundle contains detector and recognizer ONNX files,
+`manifest.json`, and a signed `MODEL.LICENSE`. A custom runtime bundle may omit
+the license file; it is then explicitly reported as non-commercial by default.
+An existing invalid, mismatched, inactive, or expired signed license still
+fails startup. Normal startup never downloads models. The `models` Compose tool
+supports install and strict verification for public packages; the manifest
+helper supports controlled private bundles. Catalog downloads share the
+`MODEL_ZOO_RELEASE_BASE_URL` for the dedicated
+[`model-zoo` GitHub Release](https://github.com/deepinsight/insightface/releases/tag/model-zoo);
+packages are identified by name and have no separate release/version metadata.
 
-The manifest is the runtime truth for:
+The strict V1 manifest is the runtime truth for its declared bundle metadata.
+The extensible V2 manifest instead names tasks and their input contracts and
+does not define a separate model-version field. A V2 task may declare an
+optional ONNX SHA-256; the Server verifies declared detector/recognizer digests
+and always calculates their actual digests. Older manifests may contain
+`model_version`; loading ignores it. New manifests, API responses, SDK result
+types, and database rows omit that field. Together, the manifest and runtime
+inspection determine:
 
 - detector and recognizer file names;
 - task and model identities;
-- model version;
 - input size and dynamic-input behavior;
 - embedding dimension;
 - normalization and preprocessing versions;
-- artifact SHA-256 used for diagnostics and Collection compatibility.
+- verified-when-declared and runtime-calculated artifact SHA-256 used for
+  diagnostics and Collection compatibility.
 
 The signed model license is an offline compliance credential, not DRM. It binds
 authorization to `model_id`, issuer, use, and optional validity interval. It
@@ -156,16 +180,103 @@ approved FP16 or other format conversion. Verification uses the bundled
 InsightFace Ed25519 public key. The issuer private key stays under an ignored
 private issuer directory and never enters a container or commit.
 
-The four public package licenses start at `2021-09-22T00:00:00Z`, have no end
-date, and state non-commercial use. A future private model can share a detector
-with a public bundle but needs a license whose `model_id` matches the private
-recognizer identity. A not-yet-effective or expired commercial license must
-fail startup clearly.
+The five Buffalo/Antelope public package licenses start at
+`2021-09-22T00:00:00Z`; the two Raccoon licenses start at
+`2026-08-29T00:00:00Z`. They have no end date and state non-commercial use. A
+future private model can share a detector with a public bundle but needs a
+license whose `model_id` matches the private recognizer identity. A
+not-yet-effective or expired commercial license must fail startup clearly.
 
 Changing detector or recognizer can change detection, alignment, preprocessing,
 or embedding semantics. The computed bundle contract therefore pins every
 Collection. Do not bypass `collection_model_mismatch`; phase one intentionally
 requires explicit rebuild or migration.
+
+### 5.1 Optional liveness and Web preparation
+
+The shipped configuration and omitted addon keys both default to disabled:
+`inference.addons = []` and `addons.auto_download = []`. Enabling liveness does
+not change the recognition model digest or the existing Collection contract.
+The model catalog pins the public URL, size and SHA-256; addons remain flat at
+`<models_dir>/addons/liveness.onnx`, independent of the base model bundle.
+`raccoon_s` and `raccoon_l` are supported detector/recognizer packages. The
+Server does not load their verifier model or provide Web base-package switching.
+
+`GET /v1/addons/liveness` distinguishes current execution (`enabled`), a
+verified file (`installed`), next-start configuration (`configured_enabled`),
+and `restart_required`. `POST /v1/addons/liveness/enable` accepts an empty JSON
+object and returns 202 while an owned background task downloads and verifies
+the catalog artifact, then updates the two addon lists in the same
+`server.toml`. It preserves other settings and comments, validates the new
+TOML, and commits via a temporary file and atomic replacement. The job shares
+an advisory download lock with the CLI and a stable config lock with other
+processes. Duplicate requests join the running task; failures expose stable
+codes, and retries reuse verified artifacts. Closing a browser does not cancel
+the download. Shutdown prevents a later configuration commit.
+
+The running engine never reloads this configuration: an operator restarts it
+to apply the change. Startup stays offline and fails with an actionable
+`addon_model_missing` or `addon_model_invalid` error for a selected unavailable
+addon. The Web action follows existing API authentication, requires JSON, and
+checks browser Origin. The app has no separate administrator role. Read-only
+deployments remain supported; status explains why preparation is unavailable.
+Use the stable `unavailable_code` and error codes for UI localization;
+`unavailable_reason` and backend messages are diagnostic text, not translation
+keys. Render authored Markdown without running interface translation over it.
+Since 0.3.1, CPU and CUDA images default to root (`0:0`), and both Compose
+services use that identity with Docker's default capabilities. Do not retain a
+`cap_drop: [ALL]` override: root needs the standard file-access capabilities for
+existing host-owned model and data directories. No privileged mode is used.
+The root filesystem remains read-only, with `no-new-privileges` and bounded
+`/tmp`. Root can modify files in the writable mounts; newly downloaded files may
+be root-owned on the host.
+
+Each service has one writable `/models` bind with `create_host_path: true`.
+There is no nested addon bind, host UID/GID export, shared group, or manual addon
+preparation. The installer creates `addons/` only for an explicit addon download
+(including an explicitly configured `addons.auto_download` during model install).
+Normal startup remains offline, and disabled liveness requires no addon directory.
+Both services mount the existing whole configuration directory writable at
+`/etc/insightface` for atomic replacement. The installer no longer uses a read-only
+single-file configuration mount.
+Configuration sources must exist and are not created by Compose. Compose forwards
+download proxies to both services, while the Docker health probe uses an explicit proxy-free opener for localhost regardless
+of `HTTP_PROXY`, `HTTPS_PROXY`, or `NO_PROXY`. Web permissions and proxy setup are in the
+[user guide](user-guide.md#web-download-permissions).
+
+`models install <package> --enable-liveness` provides first-install activation
+without a running Server. It checks configuration writability before model work,
+installs and verifies the base package, configured installation addons, and
+liveness, then atomically appends `liveness` to `inference.addons` and
+`addons.auto_download`. Other entries, comments, and settings are preserved.
+Cache hits still apply activation. Download failure leaves configuration
+unchanged; save failure reports an error and exits nonzero, with valid caches
+available for retry. Without the flag, installation does not write configuration;
+`models addons install liveness` remains download-only. The next first startup
+reads the saved configuration; an already running Server requires an explicit
+restart, because `up -d` alone does not reload startup settings.
+
+Every evaluated face has the core fields `status`, `is_live`, and `live_score`.
+Fake is `status=ok` with `is_live=false`. Only insufficient source-image area
+around the aligned face produces `status=input_rejected`, with both values null
+and an additional human-readable `reason`. Live and fake results omit `reason`.
+FaceAnalysis and the API always return this English explanation:
+
+> Insufficient image area around the face for liveness detection. Move the face toward the center, step back from the camera, or use a less tightly cropped image.
+
+Use `status` and `is_live` for program logic; `reason` is not an enumeration code.
+Only the Web UI translates the display, with a generic fallback for older saved
+results without `reason`. An omitted result means no evaluation. In `normal`,
+failed/rejected liveness stops recognition; `observe` continues. Detection
+still returns all detected faces and their liveness results with HTTP 200.
+Recognition operations return the documented 422 error; inference failures
+return 503 `liveness_unavailable` and stop the operation in both modes. Invalid
+landmarks raise `ValueError` and alignment failures raise `RuntimeError` in
+FaceAnalysis; Server maps these to 503, not `input_rejected` or fake.
+Registration skips liveness by default;
+`liveness_on_registration=true` applies the configured mode, and enrollment
+review or external embeddings do not bypass it. RTSP keeps blocked faces
+separate from unknown identities.
 
 ## 6. Embedding and score contract
 
@@ -350,9 +461,10 @@ The Server processes sensitive biometric data. Preserve these design rules:
 - no image, embedding, API key, RTSP credential, or multipart-body logging;
 - default-deny CORS, exact trusted origins only;
 - image-byte, decoded-pixel, request-body, image-count, and request-time limits;
-- `/models` read-only and `/data` the only durable writable area;
-- non-root UID/GID 10001, read-only root filesystem, dropped capabilities,
-  `no-new-privileges`, bounded `/tmp`;
+- one writable `/models` mount, on-demand addon creation, a writable configuration
+  directory for atomic startup-setting saves, and persistent `/data`;
+- root UID/GID `0:0` with Docker's default capabilities, a read-only root
+  filesystem, `no-new-privileges`, bounded `/tmp`, and no privileged mode;
 - no remote model download during normal startup;
 - authenticated and non-cacheable crop/embedding access;
 - self-hosted UI with CSP and no CDN, analytics, remote font, or third-party JS;
@@ -417,8 +529,9 @@ images. Record at least:
 - actual Session providers and CUDA strict audit;
 - model/runtime/hardware identity.
 
-Docker validation records build result/digest, build-time verifier, startup
-output, actual `/v1/system`, CRUD/enrollment/search, restart persistence,
+Docker validation records the build origin and result, local image ID, any
+published registry digest, build-time verifier, startup output, actual
+`/v1/system`, CRUD/enrollment/search, restart persistence,
 strict CUDA audit, and CPU/GPU consistency. Never derive a validation claim
 only from Dockerfile text or a base-image tag.
 
@@ -464,7 +577,7 @@ All public variants share:
 ghcr.io/deepinsight/insightface-server
 ```
 
-Each stable version has two immutable tags built from one source revision:
+Each stable version has two immutable tags built from the same source inputs:
 
 ```text
 <major>.<minor>.<patch>-cpu
@@ -475,20 +588,37 @@ Each stable version has two immutable tags built from one source revision:
 overwrite an immutable version tag, and never move either stable channel until
 both versioned variants have passed validation.
 
+This workflow publishes Server images to GHCR. It does not require Git commits,
+Server Git tags, or a Server GitHub Release. Model release assets are maintained
+separately by the repository owner.
+
 ### 15.1 Prepare and validate the source
 
-Use the relaxed precheck while the tree contains local edits:
-
-```bash
-make -C server release-precheck
-```
-
-Before publication, commit all release source and use a clean worktree. The
-strict check verifies synchronized backend, SDK, documentation, Compose, Docker,
-license metadata, Git revision, and release-tag state:
+Run the version and structural consistency checks against the local source tree:
 
 ```bash
 make -C server release-preflight
+# Backward-compatible precheck entry point, with the same checks:
+make -C server release-precheck
+```
+
+Both entry points run the same 39 checks for synchronized backend, SDK,
+documentation, Compose, Docker, and license metadata. Uncommitted changes, a
+missing `.git` directory, or unavailable Git commands produce no warning or
+failure in these checks.
+The script's `--relaxed` flag remains accepted for compatibility; it uses the
+same rules and labels its report `mode: precheck`.
+
+Reports use `schema_version: 2`. Optional `git` metadata contains
+`head_revision` (a string or `null`) and `dirty` (a boolean or `null`).
+`source_revision` is populated only when a valid HEAD and a clean tree are
+known; otherwise it is `null`. This describes the source at precheck time and
+does not identify an image built earlier. A HEAD value from a dirty tree must
+not be presented as the exact source of that build.
+
+Run the quality checks before qualifying the images:
+
+```bash
 make -C server lint
 make -C server test
 make -C server test-api
@@ -508,12 +638,15 @@ python3.11 -m twine check /tmp/ifs-server-dist/* /tmp/ifs-sdk-dist/*
 
 ### 15.2 Build and qualify both images
 
-Build both immutable version tags from the exact committed revision:
+Build both variants from the same source inputs, including any intended local
+edits. Keep files used by the build unchanged between the CPU and CUDA builds.
+The source tree can be a working checkout or a complete copy without Git
+metadata. A retained source copy, archive, or content digest can help later
+traceability, but no particular snapshot mechanism is required.
 
 ```bash
-export RELEASE_VERSION=0.2.0
+export RELEASE_VERSION=0.3.1
 export RELEASE_IMAGE=ghcr.io/deepinsight/insightface-server
-export RELEASE_SHA="$(git rev-parse HEAD)"
 
 make -C server build-cpu \
   SERVER_VERSION="$RELEASE_VERSION" \
@@ -523,8 +656,43 @@ make -C server build-cuda12 \
   CUDA_IMAGE="$RELEASE_IMAGE:$RELEASE_VERSION-cuda12"
 ```
 
+Record the resulting local image IDs and associate the validation results with
+those images. The following commands assume both images are on the current
+Docker host; if separate build hosts are used, retain each host's image ID and
+the corresponding validation record.
+
+```bash
+CPU_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE:$RELEASE_VERSION-cpu")" || exit 1
+CUDA_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE:$RELEASE_VERSION-cuda12")" || exit 1
+export CPU_IMAGE_ID CUDA_IMAGE_ID
+printf 'CPU image ID: %s\nCUDA image ID: %s\n' "$CPU_IMAGE_ID" "$CUDA_IMAGE_ID"
+```
+
+Qualify the supplied Compose files with absent model and addon directories, an
+existing configuration directory, and a fresh data volume. Verify automatic
+model-root creation, base-model installation and cache reuse, startup with
+liveness disabled and no addon directory, explicit CLI and Web addon download,
+configuration saving, manual-restart activation, and repeated cache reuse. Test
+`models install <package> --enable-liveness` before the first Server startup,
+including cached models, preserved configuration comments/entries, unavailable
+configuration failing before downloads, download failure leaving configuration
+unchanged, and configuration-save failure returning nonzero. Confirm plain
+installation and `models addons install liveness` do not write configuration.
+Confirm root identity, Docker's default capabilities, one writable model bind,
+and the retained read-only root filesystem and `no-new-privileges`.
+
+Also qualify an upgrade using isolated copies of the previous configuration,
+model files, and data volume. Apply the new Compose settings and all custom
+overrides, rather than changing image tags alone: remove old UID/GID, shared-group,
+`cap_drop: [ALL]`, read-only model-root, nested-addon, and installer read-only
+single-file configuration settings. Both services need the whole existing
+configuration directory mounted writable. Keep the actual
+paths and volume name. Check existing Collections, samples, and search results
+after recreation and restart. Keep backup and rollback instructions aligned with
+the [User Guide](user-guide.md#upgrade-to-031).
+
 Run the CPU image on a Linux x86-64 host and the CUDA image on a compatible
-NVIDIA host with the verified model directory mounted read-only. For both
+NVIDIA host with the verified model directory mounted writable. For both
 variants, check startup, `/v1/health`, `/v1/system`, CRUD/enrollment/search,
 restart persistence, and a private authorized image containing exactly one
 usable face:
@@ -540,29 +708,27 @@ startup checks. Compare CPU and CUDA results for the same image and retain only
 redacted validation notes; never commit the image, embedding, credentials, RTSP
 URLs, or raw biometric output.
 
-### 15.3 Lock the source identity
+### 15.3 Retain the validated images and build record
 
-Fetch tags before any registry write and stop on a tag conflict. Reuse an
-existing release tag only when it is an annotated, validly signed tag for the
-exact release commit; otherwise create and verify it. Pushing the same
-source-bound tag is safe to retry, while a conflicting remote tag is rejected:
+Keep the validated local images for publication and record their image IDs,
+build command, version, and test results. A source snapshot or digest captured
+at build time is optional supporting evidence. Git HEAD may also be recorded
+when available, together with whether the tree had local changes. Neither a
+dirty HEAD nor a preflight report created later proves the exact build inputs.
 
-```bash
-git fetch origin --tags || exit 1
-if git show-ref --verify --quiet "refs/tags/server-v$RELEASE_VERSION"; then
-  if test "$(git rev-list -n 1 "server-v$RELEASE_VERSION")" != "$RELEASE_SHA"; then
-    echo "release tag points to another revision" >&2
-    exit 1
-  fi
-else
-  git tag -s "server-v$RELEASE_VERSION" "$RELEASE_SHA" \
-    -m "InsightFace Server $RELEASE_VERSION" || exit 1
-fi
-git tag -v "server-v$RELEASE_VERSION" || exit 1
-git push origin \
-  "refs/tags/server-v$RELEASE_VERSION:refs/tags/server-v$RELEASE_VERSION" ||
-  exit 1
-```
+Publish these same validated images. Committing or organizing Git history
+afterward does not require a rebuild when the build inputs have not changed.
+README files are not copied into Server images, so README-only edits also do
+not require a container rebuild. User/API Guides, this maintainer guide, guide
+images, and frontend assets are included in the images. Changes to those files
+or to any other image inputs require rebuilding the affected images and
+validating them again before publication. Do not rebuild an already validated
+image just to attach a later Git commit to the release.
+
+When transferring an image between Docker hosts, preserve it with
+`docker save`/`docker load` or an existing registry digest and verify that the
+image ID is unchanged. A local image ID and a registry manifest digest identify
+different objects; record both instead of comparing them directly.
 
 ### 15.4 Publish manually to GHCR
 
@@ -594,12 +760,16 @@ for VARIANT in cpu cuda12; do
 done
 ```
 
-Only after confirming both immutable tags are absent, push both validated
-images:
+After confirming both immutable tags are absent, check that the local tags
+still point to the images that passed validation, then push them. Restore
+`CPU_IMAGE_ID` and `CUDA_IMAGE_ID` from the build record if this is a new shell
+or publication host; do not replace them with IDs from unverified images.
 
 ```bash
-docker push "$RELEASE_IMAGE:$RELEASE_VERSION-cpu"
-docker push "$RELEASE_IMAGE:$RELEASE_VERSION-cuda12"
+test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE:$RELEASE_VERSION-cpu")" = "$CPU_IMAGE_ID" || exit 1
+test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE:$RELEASE_VERSION-cuda12")" = "$CUDA_IMAGE_ID" || exit 1
+docker push "$RELEASE_IMAGE:$RELEASE_VERSION-cpu" || exit 1
+docker push "$RELEASE_IMAGE:$RELEASE_VERSION-cuda12" || exit 1
 ```
 
 Resolve and validate the two remote digests. These digest references, not the
@@ -624,6 +794,16 @@ case "$CPU_DIGEST:$CUDA_DIGEST" in
 esac
 ```
 
+Read the published images back by those exact digests and verify that their
+local image IDs match the validated images:
+
+```bash
+docker pull "$RELEASE_IMAGE@$CPU_DIGEST" || exit 1
+test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE@$CPU_DIGEST")" = "$CPU_IMAGE_ID" || exit 1
+docker pull "$RELEASE_IMAGE@$CUDA_DIGEST" || exit 1
+test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE@$CUDA_DIGEST")" = "$CUDA_IMAGE_ID" || exit 1
+```
+
 Record any existing `cpu` and `cuda12` stable-channel digests before changing
 them. Only after both versioned digests are readable and verified, move the two
 stable channels to those exact digest references:
@@ -631,10 +811,10 @@ stable channels to those exact digest references:
 ```bash
 docker buildx imagetools create \
   --prefer-index=false \
-  --tag "$RELEASE_IMAGE:cpu" "$RELEASE_IMAGE@$CPU_DIGEST"
+  --tag "$RELEASE_IMAGE:cpu" "$RELEASE_IMAGE@$CPU_DIGEST" || exit 1
 docker buildx imagetools create \
   --prefer-index=false \
-  --tag "$RELEASE_IMAGE:cuda12" "$RELEASE_IMAGE@$CUDA_DIGEST"
+  --tag "$RELEASE_IMAGE:cuda12" "$RELEASE_IMAGE@$CUDA_DIGEST" || exit 1
 ```
 
 Read both stable tags back and require their digests to match the recorded
@@ -645,12 +825,12 @@ test "$(
   docker buildx imagetools inspect "$RELEASE_IMAGE:cpu" \
     --format '{{json .Manifest}}' |
   python3.11 -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
-)" = "$CPU_DIGEST"
+)" = "$CPU_DIGEST" || exit 1
 test "$(
   docker buildx imagetools inspect "$RELEASE_IMAGE:cuda12" \
     --format '{{json .Manifest}}' |
   python3.11 -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
-)" = "$CUDA_DIGEST"
+)" = "$CUDA_DIGEST" || exit 1
 docker logout ghcr.io
 ```
 
@@ -672,3 +852,20 @@ finish the matching pair; never rebuild or overwrite a versioned tag.
   incompatible environment appear healthy.
 - Never push images, code, releases, or customer artifacts unless explicitly
   authorized.
+
+
+### Model identity and existing Collections
+
+Models are identified by `model_id` (the package name). The runtime bundle digest,
+embedding dimension and preprocessing contract still protect Collection
+compatibility. Model weights, inference and embeddings are unchanged by removing
+the separate model-version field.
+
+Migration `0009_model_identity.sql` persists each existing Collection's original
+`ifsemb-v1-sha256:` identifier before dropping the old model-version columns.
+Historical external FaceSample contract IDs stay unchanged, so existing trusted
+clients can continue using their recorded identifiers. New Collections use an
+`ifsemb-v2-sha256:` identifier over `[model_id, model_digest, embedding_dimension,
+preprocessing_version]`. These prefixes version the contract format, not models.
+Take a database backup before upgrading; older Server images cannot read the
+migrated schema without restoring that backup.

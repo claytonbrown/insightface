@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PublicResponseModel(BaseModel):
@@ -57,17 +57,57 @@ class FaceQuality(PublicResponseModel):
     pose: float
 
 
+class LivenessResult(BaseModel):
+    """Three core fields describe the evaluation; rejected input may also include reason.
+
+    Live: {"status":"ok","is_live":true,"live_score":0.98}.
+    Fake: {"status":"ok","is_live":false,"live_score":0.12}.
+    Unsuitable input: {"status":"input_rejected","is_live":null,"live_score":null}.
+    For input_rejected, optional reason is an English explanation with guidance for retrying.
+    Older results may omit reason. Successful and fake evaluations have only the three core fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok", "input_rejected"] = Field(
+        description=(
+            "ok means the model evaluated the face, including fake verdicts. "
+            "input_rejected means the input does not meet liveness requirements "
+            "(for example, insufficient image coverage near an edge)."
+        ),
+    )
+    is_live: bool | None = Field(
+        description=(
+            "For status=ok, true or false according to the configured liveness_threshold. "
+            "Null only for input_rejected; it does not mean the addon is disabled."
+        ),
+    )
+    live_score: float | None = Field(
+        description="Live probability from 0 to 1 for status=ok; null for input_rejected.",
+    )
+    reason: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Optional English explanation and retry guidance, present only for input_rejected. "
+            "Older results may omit it. Omitted for status=ok."
+        ),
+    )
+
+
 class FaceObservation(PublicResponseModel):
     bbox: BoundingBox
     landmarks: list[list[float]]
     detection_score: float
     quality: FaceQuality
     embedding: list[float] | None = None
+    liveness: LivenessResult | None = Field(
+        default=None,
+        description="Omitted when liveness was not evaluated for this face.",
+    )
 
 
 class ModelComponent(PublicResponseModel):
     model_id: str
-    model_version: str
     task: str
     sha256: str
     file: str | None = None
@@ -78,13 +118,13 @@ class ModelComponent(PublicResponseModel):
 
 class ModelSummary(PublicResponseModel):
     model_id: str
-    model_version: str
     model_digest: str
     embedding_dimension: int
     preprocessing_version: str
     provider: str
     models: list[ModelComponent]
     license: dict[str, Any] | None
+    addons: list[ModelComponent] | None = None
 
 
 class DetectionProfile(PublicResponseModel):
@@ -100,7 +140,6 @@ class Collection(PublicResponseModel):
     description: str
     default_threshold: float
     model_id: str
-    model_version: str
     model_digest: str
     embedding_dimension: int
     preprocessing_version: str
@@ -138,19 +177,37 @@ class FaceSample(PublicResponseModel):
     detection_score: float
     quality: FaceQuality
     model_id: str
-    model_version: str
     model_digest: str
     preprocessing_version: str
     embedding_source: Literal["server", "external_trusted"]
     embedding_contract_id: str | None
     has_crop: bool
     created_at: str
+    liveness: LivenessResult | None = Field(
+        default=None,
+        description=(
+            "Saved evaluation from registration, omitted when no evaluation occurred. "
+            "Historical results remain available even if liveness is now disabled."
+        ),
+    )
 
 
 class RejectedImage(PublicResponseModel):
     index: int
     filename: str
-    reason: str
+    reason: str = Field(
+        description=(
+            "Actual rejection reason, such as low_quality, liveness_fake, or "
+            "liveness_input_rejected. A separate liveness result does not replace this reason."
+        ),
+    )
+    liveness: LivenessResult | None = Field(
+        default=None,
+        description=(
+            "Supplemental evaluation when available, including rejection for other reasons. "
+            "Omitted when liveness was not evaluated."
+        ),
+    )
 
 
 class Match(PublicResponseModel):
@@ -235,6 +292,13 @@ class MonitorState(PublicResponseModel):
     faces: list[dict[str, Any]]
     matched_faces: int
     unknown_faces: int
+    liveness_blocked_faces: int = Field(
+        default=0,
+        description=(
+            "Faces blocked by normal-mode liveness; counted separately from unknown_faces "
+            "and excluded from identity search and person_enter events."
+        ),
+    )
     preview: MonitorPreviewState
     reconnects: int
     inference_errors: int
@@ -286,6 +350,26 @@ class ModelsResponse(ResponseEnvelope):
     models: list[ModelComponent]
     execution_provider: str
     license: dict[str, Any] | None
+    addons: list[ModelComponent] | None = None
+
+
+class AddonPreparationError(BaseModel):
+    code: str
+    message: str
+
+
+class LivenessManagementResponse(ResponseEnvelope):
+    enabled: bool = Field(description="Whether liveness is active in the running Server.")
+    installed: bool = Field(description="Whether the local addon passes the official SHA256 check.")
+    configured_enabled: bool = Field(description="Whether the current on-disk config enables liveness for the next startup.")
+    restart_required: bool = Field(description="The saved liveness selection differs from the running Server.")
+    can_enable: bool
+    unavailable_code: str | None = Field(description="Stable reason code for clients to localize unavailable_reason; null when preparation is available.")
+    unavailable_reason: str | None
+    state: Literal["idle", "downloading", "ready", "error"]
+    error: AddonPreparationError | None
+    model_path: str
+    config_file: str | None
 
 
 class DetectResponse(ResponseEnvelope):

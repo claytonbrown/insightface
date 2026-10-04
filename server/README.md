@@ -8,7 +8,7 @@
 API, SQLite, and local CPU or NVIDIA GPU inference in one container.**
 
 ```text
-upload an image -> detect, compare, enroll, or search
+upload an image -> detect, check liveness, compare, enroll, or search
 ```
 
 > **Model license:** Public InsightFace pretrained models are generally
@@ -21,16 +21,23 @@ embeddings, models, and indexes can remain inside your network. It is **not** an
 AWS-compatible replacement and does not implement SigV4, IAM, Region, or AWS
 resource semantics.
 
-Current release: **0.2.0**, Linux x86_64.
+Current release: **0.3.1**, Linux x86_64.
 
 | Runtime | Image |
 | --- | --- |
-| CPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cpu` |
-| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cuda12` |
+| CPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cpu` |
+| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cuda12` |
 
 The moving `cpu` and `cuda12` tags identify the latest stable release in each
 runtime family. There is no ambiguous `latest` tag. See
 [Maintainer Guide — English](docs/maintainer-guide.md) for the release policy.
+
+**0.3.1 deployment update:** Server and the model installer now run as root,
+with one writable model mount and automatic addon-directory creation on download.
+No host UID/GID or shared-group setup is needed. Update Compose as well as the
+image tag; keep existing models, configuration, and data. Since 0.3.0, Server also
+supports Raccoon manifests, optional liveness, and BMP input; API/SDK results omit
+`model_version`. See [upgrade steps](docs/user-guide.md#upgrade-to-031).
 
 ![InsightFace Server dashboard in English](docs/images/customer/dashboard-en.jpg)
 
@@ -48,15 +55,17 @@ runtime family. There is no ambiguous `latest` tag. See
 - Exact GPU search with FP32, FP16, BF16, and INT8 vector storage.
 - Multilingual Web UI for Dashboard, Collections, People, Detect, Compare,
   Search, RTSP monitoring, System diagnostics, and Help.
-- 29 snake_case REST operations under `/v1`, including authenticated
+- 31 snake_case REST operations under `/v1`, including authenticated
   `/v1/embeddings`, plus a typed lightweight Python SDK.
 - Persistent server-side RTSP Monitors with bounded in-memory events,
   independent clients, and optional `preview.mjpeg`; closing the browser does
   not stop monitoring.
 - SQLite as the durable source of truth, disposable in-memory exact indexes,
-  read-only `/models`, persistent `/data`, migrations, health checks, and
+  one writable model mount, a writable configuration directory, persistent `/data`, migrations, health checks, and
   strict CUDA startup validation without silent CPU fallback.
-- JPEG, PNG, and WebP input; original uploads are not retained by default.
+- JPEG, PNG, WebP, and BMP input; original uploads are not retained by default.
+
+Liveness is disabled by default: `inference.addons = []` and `addons.auto_download = []` in `server/config/server.toml`. **System → Liveness** downloads and verifies the model, then saves activation for the next manual restart; a verified cached model is reused. Startup never downloads models. An enabled addon missing its model stops startup with an installation hint. Each evaluated face returns the core fields `status`, `is_live`, and `live_score`; only `input_rejected` adds a human-readable `reason`. The default mode is `normal`; registration skips liveness by default (`liveness_on_registration = false`). See [configuration, Web permissions and upgrade instructions](docs/user-guide.md#optional-liveness-addon).
 
 ### RTX 5090 GPU search performance
 
@@ -121,17 +130,31 @@ configuration.
 From a complete InsightFace repository checkout, install a model into
 `server/.models`:
 
+Run from the repository root with `server/config/server.toml` present. Server and the model installer run as root (`0:0`). Compose creates `server/.models` if missing and mounts it once at `/models` with write access; `addons/` is created when an addon download is requested. No UID/GID exports or manual addon-directory or permission setup is needed.
+
 ```bash
-mkdir -p server/.models
 docker compose -f server/deploy/compose.cpu.yml pull
 docker compose -f server/deploy/compose.cpu.yml \
   run --rm models install buffalo_l --accept-license
 ```
 
-The model tool also supports `buffalo_m`, `buffalo_sc`, and `antelopev2`. It
-writes `manifest.json` and the signed `MODEL.LICENSE`; use `models verify` to
-check the installed package. Model terms remain separate from the Server source
-license.
+Optionally install and configure liveness by using this model-install command instead:
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+The Server does not need to be running. On a new deployment, the next `up -d` starts with liveness enabled; if Server is already running, use `docker compose -f server/deploy/compose.cpu.yml restart server`. `up -d` alone does not reload saved settings. For CUDA, use `compose.cuda12.yml`.
+
+The model tool supports all seven FaceAnalysis packages: `buffalo_l`,
+`buffalo_m`, `buffalo_s`, `buffalo_sc`, `antelopev2`, `raccoon_s`, and
+`raccoon_l`. It installs only each package's detector and recognizer, writes
+`manifest.json` and the signed `MODEL.LICENSE`, and ignores Raccoon's
+PrivateFrame-only verifier. Use `models verify` to check the installed package.
+Model terms remain separate from the Server source license. Catalog archives
+are downloaded from the dedicated
+[`model-zoo` GitHub Release](https://github.com/deepinsight/insightface/releases/tag/model-zoo).
 
 Start CPU:
 
@@ -169,8 +192,12 @@ workflow.
 
 ## Build from source
 
+You can build directly from a complete local source directory, including
+uncommitted changes or a directory without `.git`. Git commits and pushes
+are not prerequisites for building.
+
 The Dockerfiles copy `server/` and selected inference modules from
-`python-package/insightface/`, so the complete repository is the build context.
+`python-package/insightface/`, so the complete source directory is the build context.
 
 CPU:
 
@@ -256,7 +283,7 @@ legal-compliance layer. Deployment and security guidance is in the
 
 This release does not implement AWS/CompreFace compatibility, CUDA 11, Jetson,
 ARM64, Windows containers, TensorRT, Kubernetes, distributed Workers, persistent
-Monitor events or recording/NVR, liveness, deepfake detection, or demographic
+Monitor events or recording/NVR, deepfake detection, or demographic
 attributes.
 
 ## Documentation

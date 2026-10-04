@@ -8,7 +8,7 @@
 REST API, SQLite und lokaler CPU- oder NVIDIA-GPU-Inferenz in einem Container.**
 
 ```text
-Bild hochladen -> erkennen, vergleichen, registrieren oder suchen
+Bild hochladen -> erkennen, Lebenderkennung durchführen, vergleichen, registrieren oder suchen
 ```
 
 > **Modelllizenz:** Öffentliche vortrainierte InsightFace-Modelle sind in der
@@ -22,16 +22,20 @@ Infrastruktur. Bilder, Embeddings, Modelle und Indizes können im eigenen Netz
 bleiben. Er ist **kein** AWS-kompatibler Ersatz und implementiert weder SigV4,
 IAM, Region noch AWS-Ressourcensemantik.
 
-Aktuelle Version: **0.2.0**, Linux x86_64.
+Aktuelle Version: **0.3.1**, Linux x86_64.
 
 | Laufzeit | Image |
 | --- | --- |
-| CPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cpu` |
-| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cuda12` |
+| CPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cpu` |
+| NVIDIA GPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cuda12` |
 
 Die beweglichen Tags `cpu` und `cuda12` bezeichnen die neueste stabile Version
 der jeweiligen Laufzeitfamilie. Ein mehrdeutiges `latest` gibt es nicht. Siehe
 [Maintainer Guide — English](docs/maintainer-guide.md) für die Release-Regeln.
+
+**Neuerungen und Upgrade auf 0.3.1:** Server und Modellinstaller laufen als root; ein einziges schreibbares Modell-Mount ersetzt das separate Addon-Mount. Compose erstellt das Modellverzeichnis bei Bedarf, ohne manuelle UID/GID- oder Rechtekonfiguration. Aktualisieren Sie auch Compose-Dateien und eigene Overrides; behalten Sie die vorhandenen Modell-, Konfigurations- und Datenpfade. Siehe [Upgrade-Anleitung](docs/user-guide.de.md#upgrade-auf-031).
+
+Seit 0.3.0 werden `raccoon_s`, `raccoon_l`, ihre Modell-Manifeste, optionale Liveness mit Web-Installation und BMP-Eingaben unterstützt. Seitdem enthalten API- und SDK-Ergebnisse kein `model_version` mehr. Liveness bleibt bis zur Aktivierung ausgeschaltet.
 
 ![InsightFace Server Dashboard auf Englisch](docs/images/customer/dashboard-en.jpg)
 
@@ -48,16 +52,18 @@ der jeweiligen Laufzeitfamilie. Ein mehrdeutiges `latest` gibt es nicht. Siehe
 - Exakte GPU-Suche mit FP32-, FP16-, BF16- und INT8-Vektorspeicherung.
 - Mehrsprachige Web UI für Dashboard, Collections, Personen, Detect, Compare,
   Search, RTSP-Monitoring, Systemdiagnose und Hilfe.
-- 29 snake_case-REST-Operationen unter `/v1`, einschließlich geschütztem
+- 31 snake_case-REST-Operationen unter `/v1`, einschließlich geschütztem
   `/v1/embeddings`, plus schlankem typisierten Python SDK.
 - Serverseitige RTSP Monitors mit begrenzten In-Memory-Ereignissen, mehreren
   Clients und optionalem `preview.mjpeg`; das Schließen des Browsers beendet
   die Überwachung nicht.
 - SQLite als dauerhafte Quelle, rekonstruierbare exakte In-Memory-Indizes,
-  schreibgeschütztes `/models`, persistentes `/data`, Migrationen,
+  ein einziges schreibbares Modell-Mount und ein schreibbares Konfigurationsverzeichnis, persistentes `/data`, Migrationen,
   Healthchecks und strikte CUDA-Prüfung ohne stillen CPU-Fallback.
-- JPEG-, PNG- und WebP-Eingaben; Originaluploads werden standardmäßig nicht
+- JPEG-, PNG-, WebP- und BMP-Eingaben; Originaluploads werden standardmäßig nicht
   gespeichert.
+
+Liveness ist standardmäßig deaktiviert: `inference.addons = []` und `addons.auto_download = []` in `server/config/server.toml`. **System → Lebenderkennung** lädt das Modell herunter, prüft es und speichert die Aktivierung für den nächsten manuellen Neustart. Ein geprüfter Cache wird wiederverwendet. Beim Start wird nichts heruntergeladen; fehlt ein aktiviertes Modell, stoppt der Start mit Installationshinweis. Ausgewertete Gesichter liefern die Kernfelder `status`, `is_live` und `live_score`; nur `input_rejected` ergänzt eine verständliche Erklärung in `reason`. Der Standardmodus ist `normal`; bei der Registrierung wird Liveness standardmäßig übersprungen (`liveness_on_registration = false`). Siehe [Konfiguration, Web-Berechtigungen und Upgrade](docs/user-guide.de.md#optionales-liveness-addon).
 
 ### GPU-Suchleistung auf der RTX 5090
 
@@ -125,15 +131,26 @@ oder Produktionskonfiguration.
 Installieren Sie in einem vollständigen InsightFace-Checkout ein Modell nach
 `server/.models`:
 
+Führen Sie die Befehle im Repository-Stamm aus; `server/config/server.toml` muss vorhanden sein. Server und Modellinstaller laufen als root (`0:0`). Compose erstellt `server/.models`, falls es fehlt, und bindet es einmal schreibbar unter `/models` ein. Das Unterverzeichnis `addons` entsteht erst bei einem Addon-Download. UID/GID-Exporte sowie manuelle Verzeichnis- oder Rechtevorbereitung sind nicht erforderlich. Der normale Serverstart lädt keine Modelle herunter; Liveness ist standardmäßig ausgeschaltet.
+
 ```bash
-mkdir -p server/.models
 docker compose -f server/deploy/compose.cpu.yml pull
 docker compose -f server/deploy/compose.cpu.yml \
   run --rm models install buffalo_l --accept-license
 ```
 
-Das Modellwerkzeug unterstützt außerdem `buffalo_m`, `buffalo_sc` und
-`antelopev2`. Es schreibt `manifest.json` und die signierte `MODEL.LICENSE`;
+Optional können Sie Liveness bei der Modellinstallation konfigurieren; verwenden Sie dafür stattdessen:
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+Server muss dafür nicht laufen. Bei einer Neuinstallation aktiviert das nächste `up -d` Liveness; bei einem bereits laufenden Server ist `docker compose -f server/deploy/compose.cpu.yml restart server` erforderlich. `up -d` allein lädt gespeicherte Einstellungen nicht neu. Für CUDA verwenden Sie `compose.cuda12.yml`.
+
+Das Modellwerkzeug unterstützt alle sieben Pakete: `buffalo_l`, `buffalo_m`,
+`buffalo_s`, `buffalo_sc`, `antelopev2`, `raccoon_s` und `raccoon_l`. Es
+schreibt `manifest.json` und die signierte `MODEL.LICENSE`;
 `models verify` prüft das installierte Paket. Die Modellbedingungen sind von
 der Server-Quelllizenz getrennt.
 
@@ -173,8 +190,12 @@ Den vollständigen ersten Ablauf erklärt das
 
 ## Aus Quellcode bauen
 
+Sie können direkt aus einem vollständigen lokalen Quellcodeverzeichnis bauen,
+auch mit nicht committeten Änderungen oder ohne `.git`-Verzeichnis. Git-Commits
+und Pushes sind keine Voraussetzung für den Build.
+
 Die Dockerfiles kopieren `server/` und ausgewählte Inferenzmodule aus
-`python-package/insightface/`; daher ist das vollständige Repository der
+`python-package/insightface/`; daher ist das vollständige Quellcodeverzeichnis der
 Build-Kontext.
 
 CPU:
@@ -248,6 +269,8 @@ Installation, Eingaben, Methoden und vollständige SDK-Abläufe stehen im
 
 ## Sicherheit
 
+Das mitgelieferte Deployment läuft als root mit den Docker-Standard-Capabilities und kann in Modell-, Konfigurations- und Daten-Mounts schreiben. Das übrige Container-Dateisystem bleibt schreibgeschützt; `no-new-privileges` bleibt aktiv. Beschränken Sie den Hostzugriff und die eingebundenen Verzeichnisse.
+
 Gesichtsbilder und Embeddings sind biometrische Daten. Aktivieren Sie bei
 Netzbetrieb die Authentifizierung, terminieren Sie HTTPS an einem vertrauenswürdigen
 Reverse Proxy, beschränken Sie Docker- und Volume-Zugriff, lassen Sie breites
@@ -263,7 +286,7 @@ Rechtskonformitätsmodul. Betrieb und Sicherheit stehen im
 
 Nicht enthalten sind AWS-/CompreFace-Kompatibilität, CUDA 11, Jetson, ARM64,
 Windows Container, TensorRT, Kubernetes, verteilte Worker, persistente
-Monitor-Ereignisse oder Aufnahme/NVR sowie Liveness-, Deepfake- oder
+Monitor-Ereignisse oder Aufnahme/NVR sowie Deepfake- oder
 demografische Analysen.
 
 ## Dokumentation

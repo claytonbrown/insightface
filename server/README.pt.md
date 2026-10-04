@@ -8,7 +8,7 @@
 SQLite e inferência local por CPU ou GPU NVIDIA num único contentor.**
 
 ```text
-carregar uma imagem -> detetar, comparar, registar ou pesquisar
+carregar uma imagem -> detetar, verificar a vivacidade, comparar, registar ou pesquisar
 ```
 
 > **Licença do modelo:** os modelos públicos pré-treinados InsightFace estão
@@ -22,16 +22,20 @@ embeddings, modelos e índices podem permanecer na sua rede. Não é um substitu
 compatível com AWS e não implementa SigV4, IAM, Region ou semântica de recursos
 AWS.
 
-Versão atual: **0.2.0**, Linux x86_64.
+Versão atual: **0.3.1**, Linux x86_64.
 
 | Ambiente | Image |
 | --- | --- |
-| CPU | `ghcr.io/deepinsight/insightface-server:0.2.0-cpu` |
-| GPU NVIDIA | `ghcr.io/deepinsight/insightface-server:0.2.0-cuda12` |
+| CPU | `ghcr.io/deepinsight/insightface-server:0.3.1-cpu` |
+| GPU NVIDIA | `ghcr.io/deepinsight/insightface-server:0.3.1-cuda12` |
 
 As tags móveis `cpu` e `cuda12` indicam a versão estável mais recente de cada
 família. Não existe a tag ambígua `latest`. Consulte
 [Maintainer Guide — English](docs/maintainer-guide.md) para a política.
+
+**Novidades da 0.3.1 e atualização:** Server e o instalador executam como root; uma única montagem de modelos com escrita substitui a montagem separada de addons. O Compose cria o diretório quando necessário, sem configurar UID/GID ou permissões manualmente. Atualize também os ficheiros Compose e as suas sobreposições, preservando os caminhos de modelos, configuração e dados. Consulte os [passos de atualização](docs/user-guide.pt.md#atualizar-para-031).
+
+Desde a 0.3.0 são suportados `raccoon_s`, `raccoon_l`, os seus manifestos, prova de vida opcional com instalação Web e imagens BMP. Desde essa versão, os resultados API e SDK omitem `model_version`. A prova de vida continua desativada até ser ativada.
 
 ![Dashboard InsightFace Server em inglês](docs/images/customer/dashboard-en.jpg)
 
@@ -48,14 +52,16 @@ família. Não existe a tag ambígua `latest`. Consulte
 - Pesquisa GPU exata com armazenamento vetorial FP32, FP16, BF16 e INT8.
 - Web UI multilingue para Dashboard, Collections, People, Detect, Compare,
   Search, monitorização RTSP, System e Help.
-- 29 operações REST snake_case em `/v1`, incluindo `/v1/embeddings` protegido,
+- 31 operações REST snake_case em `/v1`, incluindo `/v1/embeddings` protegido,
   mais SDK Python leve e tipado.
 - RTSP Monitors persistentes no servidor, eventos limitados em memória, vários
   clientes e `preview.mjpeg` opcional; fechar o browser não para a monitorização.
 - SQLite como fonte persistente, índices exatos reconstruíveis em memória,
-  `/models` só de leitura, `/data` persistente, migrations, health checks e
+  uma única montagem de modelos com escrita e um diretório de configuração gravável, `/data` persistente, migrations, health checks e
   validação CUDA estrita sem fallback CPU silencioso.
-- Entrada JPEG, PNG e WebP; originais não são guardados por predefinição.
+- Entrada JPEG, PNG, WebP e BMP; originais não são guardados por predefinição.
+
+A prova de vida está desativada por predefinição: `inference.addons = []` e `addons.auto_download = []` em `server/config/server.toml`. **Sistema → Detecção de vivacidade** descarrega e verifica o modelo, guardando a ativação para o próximo reinício manual; reutiliza uma cópia verificada. Não há descarga no arranque. Um modelo ativado ausente impede o arranque e apresenta instruções de instalação. Cada rosto avaliado devolve os campos principais `status`, `is_live` e `live_score`; só `input_rejected` acrescenta uma explicação para o utilizador em `reason`. O modo predefinido é `normal`; o registo ignora a prova por predefinição (`liveness_on_registration = false`). Consulte [configuração, permissões Web e atualização](docs/user-guide.pt.md#addon-opcional-de-prova-de-vida).
 
 ### Desempenho de pesquisa GPU na RTX 5090
 
@@ -119,14 +125,25 @@ configuração de produção.
 
 Num checkout completo do InsightFace, instale um modelo em `server/.models`:
 
+Execute os comandos na raiz do repositório com `server/config/server.toml` presente. Server e o instalador de modelos executam como root (`0:0`). O Compose cria `server/.models` se não existir e monta-o uma única vez com escrita em `/models`. O subdiretório `addons` é criado ao descarregar um addon. Não são necessários exports UID/GID nem preparação manual de diretórios ou permissões. O arranque normal não descarrega modelos; a prova de vida está desativada por predefinição.
+
 ```bash
-mkdir -p server/.models
 docker compose -f server/deploy/compose.cpu.yml pull
 docker compose -f server/deploy/compose.cpu.yml \
   run --rm models install buffalo_l --accept-license
 ```
 
-A ferramenta também suporta `buffalo_m`, `buffalo_sc` e `antelopev2`. Escreve
+Opcionalmente pode configurar a prova de vida ao instalar o modelo; substitua o comando de instalação por:
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+Server não precisa de estar em execução. Numa instalação nova, o próximo `up -d` ativa a prova de vida; se Server já estiver em execução, use `docker compose -f server/deploy/compose.cpu.yml restart server`. `up -d` sozinho não recarrega as definições guardadas. Para CUDA use `compose.cuda12.yml`.
+
+A ferramenta suporta os sete pacotes: `buffalo_l`, `buffalo_m`, `buffalo_s`,
+`buffalo_sc`, `antelopev2`, `raccoon_s` e `raccoon_l`. Escreve
 `manifest.json` e o `MODEL.LICENSE` assinado; `models verify` valida o pacote.
 Os termos do modelo são separados da licença do código Server.
 
@@ -164,9 +181,13 @@ Consulte o [guia para iniciantes](docs/user-guide.pt.md) para o fluxo completo.
 
 ## Compilar a partir do código
 
+Pode compilar diretamente a partir de um diretório local com o código fonte
+completo, incluindo alterações sem commit ou um diretório sem `.git`. Fazer
+commits ou enviá-los com Git não é um requisito para compilar.
+
 Os Dockerfiles copiam `server/` e módulos de inferência selecionados de
-`python-package/insightface/`; por isso o repositório completo é o contexto de
-build.
+`python-package/insightface/`; por isso o diretório completo do código fonte é o contexto
+de build.
 
 CPU:
 
@@ -236,6 +257,8 @@ A instalação, entradas, métodos e fluxos completos do SDK estão no
 
 ## Segurança
 
+A instalação fornecida usa root com as capabilities predefinidas do Docker e pode escrever nas montagens de modelos, configuração e dados. O restante sistema de ficheiros continua só de leitura e `no-new-privileges` mantém-se ativo. Limite o acesso ao host e os diretórios montados.
+
 Imagens faciais e embeddings são dados biométricos. Em rede, ative autenticação,
 termine HTTPS num reverse proxy de confiança, restrinja Docker e volumes,
 mantenha CORS amplo desligado e defina backup, retenção, eliminação,
@@ -249,7 +272,7 @@ segurança estão no [guia do utilizador](docs/user-guide.pt.md).
 
 Não inclui compatibilidade AWS/CompreFace, CUDA 11, Jetson, ARM64, Windows
 Container, TensorRT, Kubernetes, Workers distribuídos, eventos Monitor
-persistentes ou gravação/NVR, liveness, deepfake ou atributos demográficos.
+persistentes ou gravação/NVR, deepfake ou atributos demográficos.
 
 ## Documentação
 

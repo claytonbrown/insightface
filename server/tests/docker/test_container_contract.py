@@ -20,7 +20,7 @@ def _read(relative: str) -> str:
     return (REPOSITORY_DIR / relative).read_text(encoding="utf-8")
 
 
-def test_dockerfiles_are_pinned_non_root_and_model_free() -> None:
+def test_dockerfiles_are_pinned_root_and_model_free() -> None:
     cpu = _read("server/docker/Dockerfile.cpu")
     cuda = _read("server/docker/Dockerfile.cuda12")
     cpu_lock = _read("server/requirements.cpu.lock")
@@ -40,7 +40,7 @@ def test_dockerfiles_are_pinned_non_root_and_model_free() -> None:
     assert "libcudnn9-cuda-12=9.24.0.43-1" in cuda
 
     for dockerfile in (cpu, cuda):
-        assert "USER 10001:10001" in dockerfile
+        assert "USER 0:0" in dockerfile
         assert 'VOLUME ["/data"]' in dockerfile
         assert "HEALTHCHECK" in dockerfile
         assert "/v1/health" in dockerfile
@@ -66,30 +66,33 @@ def test_dockerfiles_are_pinned_non_root_and_model_free() -> None:
 
 def test_offline_license_public_key_is_packaged_but_private_issuer_is_excluded() -> None:
     public_key = (
-        SERVER_DIR
-        / "backend"
-        / "insightface_server"
-        / "licensing"
+        REPOSITORY_DIR
+        / "python-package"
+        / "insightface"
+        / "model_zoo"
         / "trusted_keys"
         / "insightface-model-license-public-ed25519.pem"
     )
     assert public_key.read_text(encoding="ascii").startswith("-----BEGIN PUBLIC KEY-----")
     for relative in ("server/docker/Dockerfile.cpu", "server/docker/Dockerfile.cuda12"):
-        assert "COPY server/backend /opt/insightface/server/backend" in _read(relative)
+        dockerfile = _read(relative)
+        assert "COPY server/backend /opt/insightface/server/backend" in dockerfile
+        assert "COPY python-package/insightface/model_zoo " in dockerfile
     dockerignore = _read(".dockerignore")
     assert ".private/" in dockerignore
     assert "**/*.pem" in dockerignore
     assert (
-        "!server/backend/insightface_server/licensing/trusted_keys/*.pem"
+        "!python-package/insightface/model_zoo/trusted_keys/*.pem"
         in dockerignore
     )
+    assert "!server/backend/insightface_server/licensing/trusted_keys/*.pem" not in dockerignore
     assert ".private/" in _read(".gitignore")
 
 
-def test_compose_mounts_models_read_only_and_persists_data() -> None:
+def test_compose_uses_one_writable_model_mount_and_persists_data() -> None:
     variants = {
-        "server/deploy/compose.cpu.yml": ("0.2.0-cpu", "18097"),
-        "server/deploy/compose.cuda12.yml": ("0.2.0-cuda12", "18098"),
+        "server/deploy/compose.cpu.yml": ("0.3.1-cpu", "18097"),
+        "server/deploy/compose.cuda12.yml": ("0.3.1-cuda12", "18098"),
     }
     for relative, (image_tag, host_port) in variants.items():
         compose = _read(relative)
@@ -105,18 +108,34 @@ def test_compose_mounts_models_read_only_and_persists_data() -> None:
         assert "INSIGHTFACE_PORT" not in compose
         assert "target: /data" in compose
         assert "target: /models" in compose
-        assert "target: /etc/insightface/server.toml" in compose
-        assert "source: ../config/server.toml" in compose
+        assert compose.count("target: /etc/insightface\n") == 2
+        assert "target: /etc/insightface/server.toml" not in compose
+        assert "source: ../config/server.toml" not in compose
         assert "read_only: true" in compose
-        assert "user: \"10001:10001\"" in compose
+        assert compose.count('user: "0:0"') == 2
         assert "  models:\n" in compose
         assert "profiles: [tools]" in compose
         assert 'entrypoint: ["python", "-m", "insightface_server.models_cli"]' in compose
-        assert 'user: "${INSIGHTFACE_MODELS_UID:-1000}:${INSIGHTFACE_MODELS_GID:-1000}"' in compose
-        assert 'group_add: ["10001"]' in compose
+        assert "INSIGHTFACE_MODELS_UID" not in compose
+        assert "INSIGHTFACE_MODELS_GID" not in compose
+        assert "group_add:" not in compose
+        assert "cap_drop:" not in compose
+        assert "privileged:" not in compose
+        assert compose.count("no-new-privileges:true") == 2
+        assert "x-addons-path" not in compose
+        assert "target: /models/addons" not in compose
         assert "healthcheck:\n      disable: true" in compose
+        server_service = compose.split("\n  models:\n", 1)[0]
+        assert "source: ../config\n        target: /etc/insightface" in server_service
+        assert (
+            "target: /models\n        bind:\n          create_host_path: true"
+            in server_service
+        )
+        assert "source: ../config\n        target: /etc/insightface\n        bind:\n          create_host_path: false" in server_service
+        assert "HTTPS_PROXY:" in server_service
         models_service = compose.split("\n  models:\n", 1)[1]
-        assert "target: /models" in models_service
+        assert "target: /models\n        bind:\n          create_host_path: true" in models_service
+        assert "source: ../config\n        target: /etc/insightface\n        bind:\n          create_host_path: false" in models_service
         assert "gpus: all" not in models_service
         for variable in (
             "INSIGHTFACE_DEFAULT_THRESHOLD",
@@ -139,6 +158,7 @@ def test_build_context_excludes_unrelated_repository_data() -> None:
     assert "!server/**" in dockerignore
     for required in (
         "!python-package/insightface/app/**",
+        "!python-package/insightface/addons/**",
         "!python-package/insightface/model_zoo/**",
         "!python-package/insightface/utils/**",
         "!python-package/insightface/data/__init__.py",
@@ -261,6 +281,10 @@ def test_mock_container_restart_preserves_unique_named_volume() -> None:
         collection_id = created["collection"]["id"]
 
         _docker("restart", container)
+        # Docker may allocate a new ephemeral host port when restarting.
+        port_output = _docker("port", container, "8080/tcp").stdout.strip()
+        port = int(port_output.rsplit(":", 1)[1])
+        base_url = f"http://127.0.0.1:{port}"
         _wait_ready(base_url, container=container)
         status, persisted = _request(f"{base_url}/v1/collections/{collection_id}")
         assert status == 200

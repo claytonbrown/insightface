@@ -30,6 +30,7 @@ wheels/
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!python-package/packaging/desktop/pyinstaller.spec
 
 # Installer logs
 pip-log.txt
@@ -111,4 +112,11 @@ server/.models/*
 server/test-results/
 *.onnx
 
+# Local development artifacts and internal notes
+/tmp/
+/.agent_tmp/
+:memory:.ses
+**/README_INTERNAL*.md
+
 .DS_Store
+._*

@@ -22,7 +22,7 @@ These are the face alignment methods of [InsightFace](https://insightface.ai)
 
 ### Evaluation
 
-  Please refer to [evaluation](_evaluation_) page for the details of face alignment evaluation.
+  See the [Face Synthetics testing instructions](synthetics/README.md#testing) for face alignment evaluation, and each [method](#methods) for its datasets and scripts.
 
 
 ## Methods

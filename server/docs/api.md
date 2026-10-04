@@ -9,6 +9,8 @@ container and model are not running yet. The API is rooted at `/v1`, uses
 snake_case JSON fields, and accepts images as `multipart/form-data`. It is not
 an AWS Rekognition or CompreFace compatibility contract.
 
+For liveness, see [configuration, model installation and result meanings](#optional-liveness-addon). The workflow sections below also explain how it affects each operation.
+
 ## Common behavior
 
 The supplied Compose files disable authentication by default for isolated
@@ -44,7 +46,7 @@ Bounding boxes include both forms:
 }
 ```
 
-JPEG, PNG, and WebP are accepted. EXIF orientation is applied before inference.
+JPEG, PNG, WebP, and BMP are accepted. EXIF orientation is applied before inference.
 The default compressed-image limit is 10 MiB, decoded limit is 40 million
 pixels, and whole-request limit is 64 MiB.
 
@@ -66,7 +68,7 @@ Errors use standard HTTP status codes and one envelope:
 Common status mappings include 400 invalid parameters, 401 missing/invalid API
 key, 404 missing resource, 409 resource/model conflict, 413 request or image too
 large, 422 invalid image or unusable face, 500 unexpected error, and 503 timeout
-or unavailable runtime. Phase one does not include a built-in rate limiter.
+or unavailable runtime. HTTP 429 can indicate a configured stream limit; the Server does not include a general request rate limiter.
 
 OpenAPI is available at `/openapi.json`, with a same-origin interactive viewer at
 `/docs`.
@@ -116,6 +118,141 @@ unchanged in authenticated deployments.
 - Content type matters: Collection/Person patches use JSON; image operations and
   enrollment use multipart; the saved face endpoint returns JPEG; MJPEG is a
   streaming response.
+
+## Optional liveness addon
+
+### Enable and install the model
+
+Liveness is disabled by default in `server/config/server.toml`: both `inference.addons` and `addons.auto_download` are `[]`. Existing configurations that omit these keys also remain disabled.
+
+**Enable from the command line, including before the first Server startup:**
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml \
+  run --rm models install buffalo_l --accept-license --enable-liveness
+```
+
+`--enable-liveness` first checks that the existing configuration can be updated. It installs and verifies the base package, configured installation addons, and liveness, then adds `liveness` to both `inference.addons` and `addons.auto_download`, preserving other entries, comments, and settings. Verified caches are reused, but the enable setting is still saved on a cache hit. A failed download leaves the configuration unchanged; a configuration-save failure exits with an error and a nonzero status. Successfully cached files can be reused on retry.
+
+Both Compose services mount the whole existing `server/config` directory writable at `/etc/insightface`, with `create_host_path: false`, so the installer can atomically update the host configuration without a running Server. The directory and `server.toml` must exist.
+
+The Server does not need to be running. On a new deployment, the next `up -d` starts with liveness enabled; if Server is already running, use `docker compose -f server/deploy/compose.cpu.yml restart server`. `up -d` alone does not reload saved settings. For CUDA, use `compose.cuda12.yml`.
+
+Without `--enable-liveness`, `models install` keeps the existing behavior and does not write configuration; the default remains disabled. `models addons install liveness` only downloads/verifies the addon and does not enable it. You can also enable through **System → Liveness** as described below.
+
+In **System → Liveness**, choose **Download and enable after restart**. The Server downloads the published model, verifies its SHA-256, then adds `liveness` to both configuration lists while preserving other entries, comments, and settings. A verified cached file is reused. The current process stays unchanged: **manually restart the Server** to enable liveness. Download or configuration errors are shown with a retry action; a failed download does not enable liveness. A downloaded file alone does not activate it.
+
+**Advanced: configure liveness manually.** The following settings are an alternative to the enabling flag or Web action; install the model before restarting.
+
+```toml
+[inference]
+addons = ["liveness"]
+liveness_mode = "normal"
+liveness_threshold = 0.8
+liveness_compare_scope = "both"
+liveness_on_registration = false
+
+[addons]
+auto_download = ["liveness"]
+```
+
+`inference.addons` controls runtime use; `addons.auto_download` independently controls installation. Setting the latter to `["liveness"]` installs the addon alongside any supported base package, including a cached base package. Server startup never downloads models. Installer and Server read the same configuration file.
+
+Use the current Compose files and existing configuration from the [initial user-guide setup](user-guide.md). Server and installer run as root with one writable model mount; Compose creates the model root, and explicit addon downloads create `addons/`. No host UID/GID or manual permission setup is required.
+
+```bash
+docker compose -f server/deploy/compose.cpu.yml run --rm models install buffalo_l --accept-license
+# Or install only the addon:
+docker compose -f server/deploy/compose.cpu.yml run --rm models addons install liveness
+docker compose -f server/deploy/compose.cpu.yml run --rm models addons verify liveness
+docker compose -f server/deploy/compose.cpu.yml up -d --force-recreate
+```
+
+For CUDA use `compose.cuda12.yml`. The file is stored at
+`server/.models/addons/liveness.onnx` on the Compose host and is visible at
+`/models/addons/liveness.onnx` in the container. All addon models share this flat
+`addons/` directory. The installer verifies the pinned SHA-256 of the
+[published model](https://github.com/deepinsight/insightface-model-addons/releases/download/addons/liveness.onnx).
+Compose mounts the model root once with write access; addon downloads create its `addons/` subdirectory as needed. The configuration directory is also writable for Web management. Images contain code and dependencies, not pretrained weights. Upgrading with the default disabled configuration needs no addon download.
+
+If an existing deployment enables liveness without installing it, startup fails
+with `addon_model_missing`, the required path and an installation command.
+A corrupt/unreadable file produces `addon_model_invalid`. Neither case silently
+disables the addon. Run the writable installer and restart; if verification
+reports corruption, replace the invalid file with the verified published model.
+Upgrading code alone with liveness disabled keeps existing collections and
+embeddings usable. The additive database migration preserves old rows; liveness
+does not change the recognition model digest or `embedding_contract_id`.
+
+### Read liveness results
+
+Each evaluated face exposes these three core fields inside `liveness`:
+
+| Result | `status` | `is_live` | `live_score` |
+| --- | --- | --- | --- |
+| Live | `ok` | `true` | Number in `[0, 1]` |
+| Fake | `ok` | `false` | Number in `[0, 1]` |
+| Insufficient image area around the face | `input_rejected` | `null` | `null` |
+
+Only insufficient source-image area around the aligned face produces `input_rejected`. This result adds `liveness.reason`, a human-readable explanation; live and fake results omit `reason`. FaceAnalysis and the API always return this text in English; only the Web UI translates its display. Use `status` and `is_live` for program logic, not the wording of `reason`. Older saved results may lack `reason`; clients can show a generic input-rejected message as a fallback.
+
+```json
+{
+  "status": "input_rejected",
+  "is_live": null,
+  "live_score": null,
+  "reason": "Insufficient image area around the face for liveness detection. Move the face toward the center, step back from the camera, or use a less tightly cropped image."
+}
+```
+
+`is_live` uses `live_score >= liveness_threshold`. The field `liveness` is
+omitted when disabled, skipped for enrollment, or excluded by compare scope. A missing field therefore
+means the face was not evaluated; `is_live: null` means its input was rejected.
+
+- `normal` (default): detect/select the face, evaluate liveness, then extract
+  recognition features only if it passes. A failed selected face is not replaced
+  with another live face in the background.
+- `observe`: evaluate liveness and continue recognition for fake/rejected input.
+  Inference failures still return an error.
+- `liveness_compare_scope` is `both` (default), `source`, or `target`; it only
+  changes which `/v1/compare` image receives liveness evaluation. Requests cannot
+  override these startup settings. Enrollment has its own opt-in setting below.
+
+### Detection, recognition and errors
+
+`/v1/detect` returns HTTP 200 with per-face liveness, including negative results,
+and never extracts embeddings. In `normal`, `/v1/embeddings`, `/v1/compare` and
+Collection search return HTTP 422 with `liveness_fake` or
+`liveness_input_rejected`; `error.details.liveness` contains the result, including `reason` for input rejection.
+Compare adds `error.details.side` (`source` or `target`). No similarity or match
+is returned for a blocked operation. A runtime failure returns HTTP 503
+`liveness_unavailable`, rather than a fake classification. Runtime failures stop the operation in both `normal` and `observe`; they are not `input_rejected` results.
+
+### Enrollment defaults
+
+Enrollment skips liveness by default. With
+`[inference].liveness_on_registration = false`, creating a Person and adding
+FaceSamples do not run the liveness model or include `liveness` in new samples.
+Detection, recognition/external-embedding validation, and the selected
+`review_mode` still apply. This startup setting cannot be overridden per request.
+
+Set `liveness_on_registration = true` to apply the configured `normal`/`observe`
+policy during enrollment when the addon is enabled. In `normal`, rejected images
+have `reason: liveness_fake` or `liveness_input_rejected`, plus `liveness`;
+partial success is preserved. If none pass when creating a Person, the existing
+`registration_failed` error contains `rejected_images`. `review_mode=off` and
+`embedding_mode=external_trusted` do not bypass an enabled enrollment check.
+In `observe`, enrollment continues and saves the liveness result. Previously
+saved snapshots remain visible; samples never evaluated omit the field.
+
+### RTSP and Web UI
+
+RTSP faces blocked in `normal` have outer `status: liveness_blocked` and no
+identity. They count toward `liveness_blocked_faces`, not `unknown_faces`, do not
+emit person/unknown-enter events, and restart identity confirmation. Runtime
+liveness errors clear stale displayed identities. `observe` continues matching.
+The Web UI displays liveness and distinct rejection states; `/v1/models` and
+`/v1/system` report enabled addons separately from the base model files.
 
 ## System
 
@@ -173,6 +310,8 @@ are not automatically re-extracted after a profile change.
 
 ### `GET /v1/models`
 
+The `addons` list reports active addons separately from base model components. Check it for `liveness`; the System response also exposes the effective liveness settings in `safe_config`. These read-only endpoints do not install models.
+
 **Use:** Read the verified model bundle and actual provider. **Parameters:** none.
 
 **Expected work and result:** HTTP 200 returns `models`,
@@ -185,9 +324,60 @@ curl -sS "${BASE_URL}/v1/models" -H "${AUTH_HEADER}"
 
 **Common errors:** `401 unauthorized`.
 
+Supported base packages include `raccoon_s` and `raccoon_l` on CPU and CUDA; install them with the model tool before startup. This endpoint lists the running model components, not downloadable packages. The Web action below manages only liveness. Collections remain bound to their recognition model and preprocessing contract: changing a base package does not convert existing embeddings and can produce `409 collection_model_mismatch`. Enabling liveness alone does not change that contract.
+
+### `GET /v1/addons/liveness`
+
+**Use:** Read installation and next-startup settings without downloading or changing anything. This is a management endpoint, not a standalone liveness inference API.
+
+**Result:** HTTP 200. `enabled` is the running process’s state; `installed` means the file passed the published SHA-256 check and does not mean liveness is enabled. `configured_enabled` reads the current configuration file for the next startup; `restart_required` means it differs from `enabled`. `safe_config` from `/v1/system` continues to describe the running process until restart.
+
+`state` is `idle` (no verified model), `downloading` (preparation in progress), `ready` (verified model available), or `error` (preparation, file, or configuration error). In particular, `ready` alone does not mean configuration was enabled or a restart completed.
+
+`can_enable` reports whether Web preparation is available. When unavailable, `unavailable_code` is a stable reason code and `unavailable_reason` is explanatory text; both are otherwise `null`. `error` is `null` or an object with `code` and `message`. `model_path` is the local model path; `config_file` is the selected TOML path or `null`. Every response also contains `request_id`.
+
+`unavailable_code` values are `config_file_missing` (no config selected), `config_file_not_regular` (not a regular file), `config_file_mount` (single-file mount), `config_not_writable` (config or its directory is not writable), `addon_directory_not_writable` (addon storage is not writable), `addon_config_invalid` (invalid config), `addon_model_invalid` (invalid model), and `server_stopping` (shutdown in progress).
+
+```json
+{
+  "enabled": false,
+  "installed": true,
+  "configured_enabled": true,
+  "restart_required": true,
+  "can_enable": true,
+  "unavailable_code": null,
+  "unavailable_reason": null,
+  "state": "ready",
+  "error": null,
+  "model_path": "/models/addons/liveness.onnx",
+  "config_file": "/etc/insightface/server.toml",
+  "request_id": "3ed21e89-4595-4eed-a699-1df42ca62032"
+}
+```
+
+### `POST /v1/addons/liveness/enable`
+
+**Use:** Download and configure liveness for the next startup. Send an empty JSON object `{}` with `Content-Type: application/json`; no model URL or other parameters are accepted.
+
+```bash
+curl -sS "${BASE_URL}/v1/addons/liveness" -H "${AUTH_HEADER}"
+curl -sS "${BASE_URL}/v1/addons/liveness/enable" -H "${AUTH_HEADER}" \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+**Result:** HTTP 202 returns the same status fields as GET and means the job was accepted, not that liveness is active. Poll `GET /v1/addons/liveness` until preparation finishes. Duplicate requests share an active job; closing the browser does not cancel it.
+
+Only after download and SHA-256 verification does the job add `liveness` to `[inference].addons` and `[addons].auto_download` in `config_file`, preserving unrelated values and comments. A verified cached file is reused. Once `installed=true`, `configured_enabled=true` and `restart_required=true`, manually restart the Server. The new process reports `enabled=true` and `restart_required=false`. There is no hot reload or base-model switching API.
+
+**Errors:** Request errors use the normal error envelope: `400 invalid_addon_request` for a body other than `{}`, `401 unauthorized` for missing or invalid credentials when authentication is enabled, `403 origin_not_allowed` for a disallowed browser origin, `409 addon_management_unavailable` for unavailable paths/permissions/configuration, and `415 json_required` for a non-JSON content type. Browser origins must match the Server or an explicitly allowed CORS origin.
+
+An accepted job can fail later: GET still returns HTTP 200, with `state=error` and `error.code`. `addon_download_failed` leaves configuration unchanged; check the Server’s network/proxy and retry. `addon_config_save_failed` requires fixing configuration or directory permissions; a verified download remains reusable. `addon_config_invalid` means the on-disk TOML is invalid. `addon_model_invalid` requires restoring or removing the invalid cached file; it is never silently overwritten. `addon_job_in_progress` means another process holds the preparation lock; wait and refresh. Correct the cause before repeating POST.
+
 ## Stateless face operations
 
 ### `POST /v1/detect`
+
+With liveness enabled, each evaluated face includes `liveness.status`, `liveness.is_live` and `liveness.live_score`. Detect returns HTTP 200 for fake and `input_rejected` results as well; it does not extract recognition features. `input_rejected` means there is insufficient image area around the face; `liveness.reason` explains how to adjust the image. An omitted `liveness` means it was not evaluated.
 
 **Use:** Detect all usable faces without writing data. Send
 `multipart/form-data` with:
@@ -218,6 +408,8 @@ limits; `422 invalid_image`; `503 request_timeout`.
 
 ### `POST /v1/compare`
 
+Liveness runs before recognition on the sides selected by `liveness_compare_scope` (`both`, `source` or `target`). In `normal`, a blocked side returns HTTP 422 `liveness_fake` or `liveness_input_rejected`, with `error.details.liveness` and `error.details.side`; there is no similarity result. `observe` continues the comparison and includes the liveness result on each evaluated face.
+
 **Use:** Compare one selected face from each of two images without persistence.
 Send `multipart/form-data` with:
 
@@ -244,6 +436,8 @@ curl -sS http://localhost:18097/v1/compare \
 `422 invalid_image` or `face_not_found`; `503 request_timeout`.
 
 ### `POST /v1/embeddings`
+
+With liveness enabled in `normal`, fake or unsuitable input returns HTTP 422 `liveness_fake` or `liveness_input_rejected` and `error.details.liveness`; no embedding is extracted. `observe` returns the embedding together with the face liveness result.
 
 **Use:** Extract the selected face embedding for a trusted integration. Send
 `multipart/form-data` with:
@@ -317,7 +511,7 @@ profile or execution provider. CUDA BF16 additionally requires an SM80-or-newer
 device. See the [User Guide](user-guide.md) for profile and capacity semantics
 and the complete support matrix.
 
-Creation binds model ID, version, bundle digest, embedding dimension, and
+Creation binds model ID, bundle digest, embedding dimension, and
 preprocessing version. Those fields cannot be patched. Every Collection
 response also exposes a stable opaque `embedding_contract_id` derived from
 those pinned fields. Clients must copy, not construct, that ID when using
@@ -429,6 +623,8 @@ Registration that would exceed `max_faces_per_person` returns
 ## People and FaceSamples
 
 ### `POST /v1/collections/{collection_id}/persons`
+
+Liveness is skipped by default for new Persons and added FaceSamples (`liveness_on_registration=false`). When the administrator enables it, `normal` rejects fake or unsuitable input; `observe` keeps the result and continues. Enrollment review still applies. Rejection lists show the actual `reason` and any liveness result separately.
 
 **Use:** Create a Person and enroll one or more FaceSamples in one request.
 **Path parameter:** `collection_id`. Send `multipart/form-data` fields:
@@ -575,6 +771,8 @@ Person. **Common errors:** `404`; `503 search_index_unavailable`.
 
 ### `POST /v1/collections/{collection_id}/persons/{person_id}/faces`
 
+Liveness is skipped by default for new Persons and added FaceSamples (`liveness_on_registration=false`). When the administrator enables it, `normal` rejects fake or unsuitable input; `observe` keeps the result and continues. Enrollment review still applies. Rejection lists show the actual `reason` and any liveness result separately.
+
 **Use:** Add FaceSamples to an existing Person. **Path parameters:**
 `collection_id` and `person_id`. Add repeatable multipart `images`.
 `review_mode` has the
@@ -650,6 +848,8 @@ generation. A later search in the same process cannot return the deleted row.
 ## Search
 
 ### `POST /v1/collections/{collection_id}/search`
+
+With liveness enabled in `normal`, fake or unsuitable query input returns HTTP 422 `liveness_fake` or `liveness_input_rejected` and `error.details.liveness`; the search does not run. This differs from a successful empty match list. `observe` continues searching and returns liveness on the query face.
 
 **Use:** Search a Collection using the selected face in one query image.
 **Path parameter:** `collection_id`. Multipart fields:
@@ -806,6 +1006,8 @@ curl -sS -X DELETE "${BASE_URL}/v1/monitors/front-gate" \
 
 ### `GET /v1/monitors/{monitor_id}/state`
 
+With liveness enabled in `normal`, blocked faces show `status: liveness_blocked` and their separate liveness result. They increment `liveness_blocked_faces`, not `unknown_faces`, and do not trigger person/unknown entry events. `observe` continues recognition. Input rejection is displayed separately from a fake result.
+
 **Use:** Poll the live state needed by headless clients or the Web UI.
 **Result fields:** `status`, `connected`, source dimensions/FPS, configured and
 actual inference rate, processing time, skipped frames, current recognized and
@@ -855,3 +1057,6 @@ should reconnect with bounded backoff after transport loss.
 **Success:** HTTP 200 as a long-lived binary stream, not JSON. **Common errors:**
 `409 preview_disabled`; `503 stream_unavailable`; `404 monitor_not_found`; `401
 unauthorized`.
+
+
+Model, model-component, Collection and FaceSample responses omit `model_version`; `model_id` identifies a package or component according to the response context. Existing Collections retain their `embedding_contract_id`; new Collections use a contract without model-version metadata. Trusted external callers should use the contract ID returned by their target Collection.

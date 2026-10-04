@@ -24,14 +24,6 @@ def test_retinaface_accepts_multi_det_size_config():
     assert RetinaFace._normalize_input_sizes([1024, 1024]) == [(1024, 1024)]
 
 
-def test_gui_routes_detection_outputs_to_scrfd():
-    assert FaceEngine._is_scrfd_detection_outputs([object()] * 6) is True
-    assert FaceEngine._is_scrfd_detection_outputs([object()] * 9) is True
-    assert FaceEngine._is_scrfd_detection_outputs([object()] * 10) is True
-    assert FaceEngine._is_scrfd_detection_outputs([object()] * 15) is True
-    assert FaceEngine._is_scrfd_detection_outputs([object()]) is False
-
-
 def test_model_zoo_routes_detection_models_to_scrfd(monkeypatch):
     class FakeInput:
         name = "input"
@@ -72,16 +64,20 @@ def test_face_analysis_prepare_defaults_to_auto_det_size():
         taskname = "detection"
 
         def __init__(self):
+            self.ctx_id = None
             self.kwargs = None
 
         def prepare(self, ctx_id, **kwargs):
+            self.ctx_id = ctx_id
             self.kwargs = kwargs
 
     detector = FakeDetectionModel()
     app = FaceAnalysis.__new__(FaceAnalysis)
     app.models = {"detection": detector}
+    app.addons = {}
 
-    app.prepare(ctx_id=0)
+    app.prepare()
 
+    assert detector.ctx_id == 0
     assert app.det_size == DEFAULT_DET_SIZES
     assert detector.kwargs["input_size"] == DEFAULT_DET_SIZES

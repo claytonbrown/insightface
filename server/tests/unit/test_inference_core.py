@@ -170,7 +170,7 @@ def test_factory_and_summary_use_simple_public_contract() -> None:
         )
     )
     assert engine.summary.embedding_dimension == 16
-    summary = EngineSummary("id", "1", "a" * 64, 16, "1", "CPUExecutionProvider")
+    summary = EngineSummary("id", "a" * 64, 16, "1", "CPUExecutionProvider")
     assert summary.as_dict()["model_id"] == "id"
     with pytest.raises(ValueError, match="Unsupported inference_mode"):
         create_engine({"inference_mode": "remote"})
@@ -206,6 +206,21 @@ def _write_manifest(directory: Path) -> None:
     (directory / "MODEL.LICENSE").write_bytes(default_license.read_bytes())
 
 
+def _write_v2_manifest(directory: Path, verification: object) -> None:
+    _write_manifest(directory)
+    manifest = {
+        "manifest_version": 2,
+        "model_id": "buffalo_l",
+        "tasks": {
+            "detection": {"file": "detector.onnx"},
+            "verification": verification,
+            "recognition": {"file": "recognizer.onnx"},
+        },
+        "license": "MODEL.LICENSE",
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def test_onnx_engine_startup_is_once_per_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -234,6 +249,183 @@ def test_onnx_engine_startup_is_once_per_process(
     assert calls == 1
 
 
+def test_v2_engine_license_and_digest_ignore_verification_task(tmp_path: Path) -> None:
+    from insightface_server.inference.onnx_engine import OnnxInsightFaceEngine
+
+    _write_v2_manifest(tmp_path, {"file": "missing.onnx", "sha256": "wrong"})
+    first = OnnxInsightFaceEngine(
+        SimpleNamespace(
+            models_dir=tmp_path,
+            execution_provider="CPUExecutionProvider",
+            detector_threshold=0.5,
+            device_id=0,
+        )
+    )
+    _write_v2_manifest(tmp_path, "not-even-an-object")
+    second = OnnxInsightFaceEngine(
+        SimpleNamespace(
+            models_dir=tmp_path,
+            execution_provider="CPUExecutionProvider",
+            detector_threshold=0.5,
+            device_id=0,
+        )
+    )
+
+    assert "model_version" not in first.summary.as_dict()
+    assert first.summary.license is not None
+    assert first.summary.license["model_id"] == "buffalo_l"
+    assert "status" not in first.summary.license
+    assert first.summary.models == second.summary.models
+    assert first.summary.model_digest == second.summary.model_digest
+    assert [model["task"] for model in first.summary.models] == [
+        "face_detection",
+        "face_recognition",
+    ]
+
+
+def test_onnx_engine_defaults_missing_model_license_to_non_commercial(
+    tmp_path: Path,
+) -> None:
+    from insightface_server.inference.onnx_engine import OnnxInsightFaceEngine
+
+    _write_manifest(tmp_path)
+    (tmp_path / "MODEL.LICENSE").unlink()
+
+    engine = OnnxInsightFaceEngine(
+        SimpleNamespace(
+            models_dir=tmp_path,
+            execution_provider="CPUExecutionProvider",
+            detector_threshold=0.5,
+            device_id=0,
+        )
+    )
+
+    assert engine.summary.license == {
+        "license_id": None,
+        "issuer": None,
+        "model_id": "buffalo_l",
+        "grant": "non-commercial",
+        "customer": None,
+        "reference": None,
+        "valid_from": None,
+        "valid_until": None,
+        "signature_valid": False,
+        "commercial_use_permitted": False,
+        "status": "default_non_commercial",
+        "defaulted": True,
+        "message": "MODEL.LICENSE is absent; defaulting to non-commercial use",
+    }
+
+
+def test_v2_embedded_preprocessing_uses_session_input_dtype(tmp_path: Path) -> None:
+    from insightface_server.inference.onnx_engine import OnnxInsightFaceEngine
+    from insightface_server.models import ModelSpec
+
+    class FakeSession:
+        def __init__(self, input_type: str) -> None:
+            self.input_type = input_type
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(type=self.input_type)]
+
+    embedded = ModelSpec(
+        model_id="test",
+        task="face_recognition",
+        path=tmp_path / "recognizer.onnx",
+        input_size=(112, 112),
+        embedding_dimension=512,
+        preprocessing_version="embedded-v1",
+        sha256="0" * 64,
+        input_mean=0.0,
+        input_std=1.0,
+        preprocessing="embedded",
+    )
+    model = SimpleNamespace()
+    OnnxInsightFaceEngine._configure_image_preprocessing(
+        model, FakeSession("tensor(uint8)"), embedded
+    )
+    assert model.input_dtype is np.uint8
+    assert model.input_mean == 0.0
+    assert model.input_std == 1.0
+
+    mean_std = ModelSpec(
+        model_id="test",
+        task="face_recognition",
+        path=tmp_path / "recognizer.onnx",
+        input_size=(112, 112),
+        embedding_dimension=512,
+        preprocessing_version="arcface-v1",
+        sha256="0" * 64,
+        input_mean=127.5,
+        input_std=127.5,
+    )
+    with pytest.raises(RuntimeError, match=r"mean/std.*tensor\(float\)"):
+        OnnxInsightFaceEngine._configure_image_preprocessing(
+            SimpleNamespace(), FakeSession("tensor(uint8)"), mean_std
+        )
+
+
+def test_onnx_engine_keeps_one_dynamic_detector_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from insightface.model_zoo import arcface_onnx, scrfd
+    from insightface_server.inference import onnx_engine
+
+    _write_manifest(tmp_path)
+    engine = onnx_engine.OnnxInsightFaceEngine(
+        SimpleNamespace(
+            models_dir=tmp_path,
+            execution_provider="CPUExecutionProvider",
+            detector_threshold=0.5,
+            device_id=0,
+        )
+    )
+    detector_options: dict[str, object] = {}
+
+    class FakeSession:
+        def get_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(type="tensor(float)")]
+
+    class FakeDetector:
+        static_input_size = None
+
+        def __init__(self, **kwargs: object) -> None:
+            detector_options.update(kwargs)
+
+        def prepare(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class FakeRecognizer:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+    session_paths: list[Path] = []
+
+    def new_session(path: Path) -> FakeSession:
+        session_paths.append(path)
+        return FakeSession()
+
+    monkeypatch.setattr(scrfd, "SCRFD", FakeDetector)
+    monkeypatch.setattr(arcface_onnx, "ArcFaceONNX", FakeRecognizer)
+    monkeypatch.setattr(engine, "_new_session", new_session)
+    monkeypatch.setattr(engine, "_warm_up", lambda: None)
+    monkeypatch.setattr(onnx_engine, "_cuda_runtime_version", lambda: None)
+    monkeypatch.setattr(onnx_engine, "_cudnn_version", lambda: None)
+    monkeypatch.setattr(onnx_engine, "_gpu_details", lambda: [])
+
+    engine._startup_once()
+
+    assert session_paths == [
+        engine.bundle.detector.path,
+        engine.bundle.recognizer.path,
+    ]
+    assert detector_options["session"] is engine._detector_session
+    assert detector_options["static_shape_sessions"] is False
+
+
 def test_onnx_engine_refuses_tampered_model_license(tmp_path: Path) -> None:
     from insightface_server.inference.onnx_engine import OnnxInsightFaceEngine
 
@@ -245,6 +437,32 @@ def test_onnx_engine_refuses_tampered_model_license(tmp_path: Path) -> None:
     license_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="signature verification failed"):
+        OnnxInsightFaceEngine(
+            SimpleNamespace(
+                models_dir=tmp_path,
+                execution_provider="CPUExecutionProvider",
+                detector_threshold=0.5,
+                device_id=0,
+            )
+        )
+
+
+def test_onnx_engine_refuses_license_for_another_model(tmp_path: Path) -> None:
+    from insightface_server.inference.onnx_engine import OnnxInsightFaceEngine
+
+    _write_manifest(tmp_path)
+    other_license = (
+        Path(__file__).resolve().parents[2]
+        / "backend"
+        / "insightface_server"
+        / "licensing"
+        / "defaults"
+        / "raccoon_s"
+        / "MODEL.LICENSE"
+    )
+    (tmp_path / "MODEL.LICENSE").write_bytes(other_license.read_bytes())
+
+    with pytest.raises(RuntimeError, match="not the active model"):
         OnnxInsightFaceEngine(
             SimpleNamespace(
                 models_dir=tmp_path,

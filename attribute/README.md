@@ -19,6 +19,8 @@ These are the face attribute methods of [InsightFace](https://insightface.ai)
 
 ## Methods
 
+See the [attribute datasets](_datasets_/README.md) for dataset references and the [gender and age example](gender_age/README.md) for a Python inference walkthrough.
+
 
 Supported methods:
 

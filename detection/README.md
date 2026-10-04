@@ -22,7 +22,7 @@ These are the face detection methods of [InsightFace](https://insightface.ai)
 
 ### Evaluation
 
-  Please refer to [evaluation](_evaluation_) page for the details of face recognition evaluation.
+  Please refer to [SCRFD's WIDERFace evaluation instructions](scrfd/README.md#widerface-evaluation) for the face detection evaluation procedure.
 
 
 ## Methods
